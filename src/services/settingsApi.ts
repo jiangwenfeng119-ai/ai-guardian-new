@@ -1,0 +1,345 @@
+import type { ApiSyncSettings } from '../permissions';
+import type { Assessment } from '../types';
+import { checkSession, parseError } from './apiHelpers';
+/** JWT from login (sessionStorage). Legacy key kept for one release so existing sessions still work. */
+const TOKEN_KEY = 'ai_guardian_jwt';
+const LEGACY_ADMIN_KEY = 'ai_guardian_admin_token';
+
+export function getAuthToken(): string | null {
+  if (typeof sessionStorage === 'undefined') return null;
+  return sessionStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(LEGACY_ADMIN_KEY);
+}
+
+export function setAuthToken(token: string | null) {
+  if (typeof sessionStorage === 'undefined') return;
+  sessionStorage.removeItem(LEGACY_ADMIN_KEY);
+  if (token) sessionStorage.setItem(TOKEN_KEY, token);
+  else sessionStorage.removeItem(TOKEN_KEY);
+}
+
+function authHeaders(): HeadersInit {
+  const t = getAuthToken();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
+export async function apiHealth(opts?: { signal?: AbortSignal }) {
+  const res = await fetch('/api/health', { signal: opts?.signal });
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json() as Promise<{ ok: boolean; dataDir: string; ollamaProxy?: boolean }>;
+}
+
+export async function fetchSettings(opts?: { signal?: AbortSignal }) {
+  const res = await fetch('/api/settings', { headers: { ...authHeaders() }, signal: opts?.signal });
+  checkSession(res);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export async function putSettings(body: Record<string, unknown>) {
+  const res = await fetch('/api/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  checkSession(res);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export async function fetchAuditLog(limit = 30, opts?: { signal?: AbortSignal }) {
+  const res = await fetch(`/api/audit-log?limit=${limit}`, { headers: { ...authHeaders() }, signal: opts?.signal });
+  checkSession(res);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json() as Promise<{ entries: unknown[] }>;
+}
+
+export async function postModelConnectionTest(
+  model: Record<string, unknown>,
+  ensureReady = false,
+  target: 'primary' | 'local' | 'cloud' = 'primary'
+) {
+  const res = await fetch('/api/model/test-connection', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ model, ensureReady, target }),
+  });
+  checkSession(res);
+  const data = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    error?: string;
+    provider?: string;
+    endpoint?: string;
+    elapsedMs?: number;
+    detail?: string;
+  };
+  if (!res.ok || data.ok === false) {
+    throw new Error(data.error || res.statusText);
+  }
+  return data as {
+    ok: true;
+    provider?: string;
+    endpoint?: string;
+    elapsedMs?: number;
+    detail?: string;
+  };
+}
+
+export async function postStandardsSync(sync: ApiSyncSettings) {
+  const res = await fetch('/api/standards/sync', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({
+      provider: sync.provider,
+      endpoint: sync.endpoint,
+      apiKey: sync.apiKey,
+      codebuddyEndpoint: sync.codebuddyEndpoint,
+      codebuddyApiKey: sync.codebuddyApiKey,
+      codebuddySkill: sync.codebuddySkill,
+    }),
+  });
+  checkSession(res);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = (data as { error?: string; message?: string }).error || (data as { message?: string }).message || res.statusText;
+    throw new Error(msg);
+  }
+  return data as {
+    ok: boolean;
+    statusCode?: number;
+    lastSyncAt?: string;
+    preview?: string;
+  };
+}
+
+export async function fetchAssessments(opts?: { signal?: AbortSignal }) {
+  const res = await fetch('/api/assessments', { headers: { ...authHeaders() }, signal: opts?.signal });
+  checkSession(res);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json() as Promise<{ assessments: Assessment[] }>;
+}
+
+export async function putAssessments(assessments: Assessment[]) {
+  const res = await fetch('/api/assessments', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ assessments }),
+  });
+  checkSession(res);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json() as Promise<{ ok: boolean; count: number }>;
+}
+
+export async function postAiAssistantChat(body: { message: string; mode: 'default' | 'local' | 'cloud' }) {
+  const res = await fetch('/api/ai-assistant/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  checkSession(res);
+  const data = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    error?: string;
+    text?: string;
+    provider?: string;
+    model?: string;
+    route?: string;
+    elapsedMs?: number;
+  };
+  if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+  return data as { ok: true; text: string; provider: string; model: string; route: string; elapsedMs?: number };
+}
+
+export type LegalRegulationsCachePayload = {
+  empty?: boolean;
+  message?: string;
+  updatedAt?: string;
+  keyword?: string;
+  query?: string;
+  requestUrl?: string;
+  statusCode?: number;
+  rawText?: string;
+  parsedJson?: unknown;
+  postProcess?: unknown;
+  customerView?: {
+    content?: string;
+    source?: string;
+    updatedAt?: string;
+    agentAnswer?: string;
+    reviewed?: boolean;
+    reviewedAt?: string;
+    reviewedBy?: string;
+    briefing?: {
+      headline?: string;
+      summary?: string;
+      takeaways?: string[];
+    };
+    manualItems?: Array<{
+      title?: string;
+      docType?: string;
+      status?: string;
+      keyPoints?: string[];
+      controlImpacts?: string[];
+      sourceSnippet?: string;
+    }>;
+  };
+  history?: Array<{
+    ts?: string;
+    query?: string;
+    statusCode?: number;
+    totalCount?: number;
+    knowledgeBaseCount?: number;
+    requestUrl?: string;
+    urlRewritten?: boolean;
+    responseType?: string;
+    responseMessage?: string;
+  }>;
+};
+
+/** 读取服务端持久化的法律法规 API 缓存（需「标准条款编辑」权限） */
+export async function fetchLegalRegulationsCache(): Promise<LegalRegulationsCachePayload> {
+  const res = await fetch('/api/legal-regulations/cache', { headers: { ...authHeaders() } });
+  checkSession(res);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json() as Promise<LegalRegulationsCachePayload>;
+}
+
+/** 调用配置的法律法规检索 API 并写入缓存（需「第三方标准 API 同步」权限） */
+export async function postLegalRegulationsFetch(body?: {
+  url?: string;
+  keyword?: string;
+  query?: string;
+  prompt?: string;
+  searchApiKey?: string;
+  searchClientId?: string;
+  postProcessEnabled?: boolean;
+  postProcessModel?: string;
+  testOnly?: boolean;
+}) {
+  const res = await fetch('/api/legal-regulations/fetch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body || {}),
+  });
+  checkSession(res);
+  const data = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    error?: string;
+    message?: string;
+    statusCode?: number;
+    upstreamHint?: string;
+    upstreamBodySnippet?: string;
+    preview?: string;
+    urlRewritten?: boolean;
+    requestUrl?: string;
+    totalCount?: number;
+    knowledgeBaseCount?: number;
+    postProcess?: unknown;
+  };
+  if (!res.ok) {
+    const msg = data.error || data.message || res.statusText;
+    throw new Error(msg);
+  }
+  if (data.ok === false) {
+    const hint =
+      data.upstreamHint ||
+      `检索失败（HTTP ${data.statusCode != null ? String(data.statusCode) : '错误'}）`;
+    throw new Error(hint);
+  }
+  return data as {
+    ok: boolean;
+    testOnly?: boolean;
+    statusCode?: number;
+    legalLastSyncAt?: string;
+    totalCount?: number;
+    addedCount?: number;
+    addedResults?: number;
+    addedItems?: number;
+    knowledgeBaseCount?: number;
+    postProcess?: unknown;
+    preview?: string;
+    requestUrl?: string;
+    urlRewritten?: boolean;
+  };
+}
+
+export async function postLegalRegulationsDeleteItem(body: {
+  title: string;
+  docType?: string;
+  status?: string;
+  reason?: string;
+}) {
+  const res = await fetch('/api/legal-regulations/item/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  checkSession(res);
+  const data = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    error?: string;
+    removedCount?: number;
+  };
+  if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+  return data as { ok: true; removedCount: number };
+}
+
+export async function putLegalRegulationsReview(body: {
+  headline: string;
+  summary: string;
+  takeaways: string[];
+  manualItems?: Array<{
+    title?: string;
+    docType?: string;
+    status?: string;
+    keyPoints?: string[];
+    controlImpacts?: string[];
+    sourceSnippet?: string;
+  }>;
+  confidence?: number;
+  publish?: boolean;
+  reset?: boolean;
+}) {
+  const res = await fetch('/api/legal-regulations/review', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  checkSession(res);
+  const data = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    error?: string;
+    message?: string;
+    customerView?: LegalRegulationsCachePayload['customerView'];
+  };
+  if (!res.ok || data.ok === false) {
+    throw new Error(data.error || data.message || res.statusText);
+  }
+  return data;
+}
+
+export async function postLegalRegulationsRegenerateSummary(body: {
+  manualItems: Array<{
+    title?: string;
+    docType?: string;
+    status?: string;
+    keyPoints?: string[];
+    controlImpacts?: string[];
+    sourceSnippet?: string;
+  }>;
+  model?: string;
+}) {
+  const res = await fetch('/api/legal-regulations/customer-summary', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  checkSession(res);
+  const data = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    error?: string;
+    message?: string;
+    briefing?: { headline?: string; summary?: string; takeaways?: string[] };
+  };
+  if (!res.ok || data.ok === false) throw new Error(data.error || data.message || res.statusText);
+  return data;
+}

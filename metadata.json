@@ -1,0 +1,6 @@
+{
+  "name": "安全AI 守望者 - 安全合规评估工具",
+  "description": "基于 AI 的自动化安全合规评估平台，支持等保 2 级/3 级、ISO27001 等标准，自动进行差距分析并生成合规报告。",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

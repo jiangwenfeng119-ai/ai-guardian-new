@@ -1,0 +1,25 @@
+services:
+  app:
+    build:
+      context: .
+      args:
+        # 拉取 node 镜像超时：在项目根目录 .env 中设置（示例见 docker-build.env.example）：
+        # NODE_IMAGE=docker.m.daocloud.io/library/node:22-alpine
+        # NPM_REGISTRY=https://registry.npmmirror.com
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
+    ports:
+      - "8787:8787"
+    environment:
+      API_HOST: "0.0.0.0"
+      API_PORT: "8787"
+      SERVE_DIST: "1"
+      DATA_DIR: /app/data
+      # 生产环境请设置强随机密钥
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      # 容器内访问宿主机 Ollama；Linux 需配合下方 extra_hosts。宿主机 Ollama 需监听 0.0.0.0（见 docker-build.env.example）
+      OLLAMA_PROXY_TARGET: ${OLLAMA_PROXY_TARGET:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
