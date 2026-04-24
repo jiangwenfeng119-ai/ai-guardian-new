@@ -1,5 +1,5 @@
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import * as XLSX from 'xlsx';
 import { 
   Upload, 
@@ -11,7 +11,6 @@ import {
   Download,
   FileText,
   Table as TableIcon,
-  File as FileIcon,
   Loader2
 } from 'lucide-react';
 import { motion } from 'motion/react';
@@ -43,8 +42,18 @@ interface AssessmentFlowProps {
   onUpdate: (assessmentId: string, next: Assessment | ((prev: Assessment) => Assessment)) => void;
 }
 
-function initialStep(a: Assessment, canViewResults: boolean): 1 | 2 | 3 {
-  if (a.status === 'Completed' && a.findings.length > 0 && canViewResults) return 3;
+function initialStep(a: Assessment, canViewResults: boolean, controlsCountForStandard: number): 1 | 2 | 3 {
+  if (!canViewResults) {
+    if (a.status === 'In Progress') return 2;
+    if (a.findings.length > 0 && a.evidenceText) return 2;
+    return 1;
+  }
+  const fullCoverage =
+    controlsCountForStandard > 0 &&
+    a.findings.length > 0 &&
+    a.findings.length >= controlsCountForStandard;
+  if (a.status === 'Completed' && a.findings.length > 0) return 3;
+  if (fullCoverage && (a.evidenceText || '').trim()) return 3;
   if (a.status === 'In Progress') return 2;
   if (a.findings.length > 0 && a.evidenceText) return 2;
   return 1;
@@ -52,6 +61,9 @@ function initialStep(a: Assessment, canViewResults: boolean): 1 | 2 | 3 {
 
 const ANALYSIS_CACHE_KEY = 'ai_guardian_assessment_analysis_cache_v1';
 const MAX_CACHE_ITEMS = 60;
+
+const EXEC_SUMMARY_CACHE_KEY = 'ai_guardian_exec_summary_cache_v1';
+const MAX_EXEC_SUMMARY_CACHE_ITEMS = 40;
 
 function simpleHash(input: string) {
   let h = 2166136261;
@@ -82,6 +94,42 @@ function saveAnalysisCache(cache: Record<string, { findings: Finding[]; ts: numb
   } catch {
     // ignore localStorage quota errors
   }
+}
+
+function loadExecSummaryCache(): Record<string, { text: string; ts: number }> {
+  try {
+    const raw = localStorage.getItem(EXEC_SUMMARY_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, { text: string; ts: number }>;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveExecSummaryCacheEntry(cacheKey: string, text: string) {
+  try {
+    const cache = loadExecSummaryCache();
+    cache[cacheKey] = { text, ts: Date.now() };
+    const entries = Object.entries(cache)
+      .sort((a, b) => Number(b[1]?.ts || 0) - Number(a[1]?.ts || 0))
+      .slice(0, MAX_EXEC_SUMMARY_CACHE_ITEMS);
+    localStorage.setItem(EXEC_SUMMARY_CACHE_KEY, JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    // ignore localStorage quota errors
+  }
+}
+
+function findingsSummaryFingerprint(standardId: string, findings: Finding[]) {
+  const stable = [...findings]
+    .sort((a, b) => String(a.controlId).localeCompare(String(b.controlId)))
+    .map((f) => ({
+      id: f.controlId,
+      s: f.status,
+      a: (f.analysis || '').slice(0, 200),
+      r: (f.recommendation || '').slice(0, 120),
+    }));
+  return simpleHash(JSON.stringify({ standardId, rows: stable }));
 }
 
 function estimatePublishableGate(evidence: string, findingsCount: number, controlsCount: number) {
@@ -166,6 +214,16 @@ export default function AssessmentFlow({
       basedOn: '依据',
       noControlsTitle: '该标准尚未配置检查项',
       noControlsHint: '请先在「合规标准知识库」为该标准新增或导入检查项，再执行评估分析。',
+      execSummaryWaitingControls: '执行摘要将在全部条款评估完成后自动生成。',
+      reportAutoNavHint: '分析已覆盖全部条款时，将自动打开聚合报告并生成执行摘要。',
+      openReportSecondary: '打开聚合报告',
+      execSummaryTitle: '执行摘要',
+      execSummaryGenerating: '正在生成执行摘要…',
+      execSummaryReady: '执行摘要已生成',
+      execSummaryRetry: '重试',
+      backToGapAnalysis: '返回差距分析',
+      draftQualityBanner:
+        '当前任务为草稿状态（输入质量或未达发布门槛）。以下为聚合视图，正式发布前请补充证据或重跑分析。',
     },
     'en-US': {
       step1: 'Evidence',
@@ -221,6 +279,16 @@ export default function AssessmentFlow({
       basedOn: 'Based on',
       noControlsTitle: 'No controls configured for this standard',
       noControlsHint: 'Add or import controls for this standard in Standards first, then run the assessment.',
+      execSummaryWaitingControls: 'The executive summary is generated after every control has been assessed.',
+      reportAutoNavHint: 'When all controls are assessed, the aggregated report opens and the executive summary is generated automatically.',
+      openReportSecondary: 'Open aggregated report',
+      execSummaryTitle: 'Executive summary',
+      execSummaryGenerating: 'Generating executive summary…',
+      execSummaryReady: 'Executive summary ready',
+      execSummaryRetry: 'Retry',
+      backToGapAnalysis: 'Back to gap analysis',
+      draftQualityBanner:
+        'This assessment is a draft (input quality or publish gate). Below is the aggregated view; add evidence or re-run before publishing.',
     },
   } as const;
   const t = (k: keyof (typeof T)['zh-CN']) => T[locale][k] || T['zh-CN'][k];
@@ -243,16 +311,24 @@ export default function AssessmentFlow({
   const patch = (next: Assessment | ((prev: Assessment) => Assessment)) => {
     onUpdate(assessment.id, next);
   };
-  const [step, setStep] = useState<1 | 2 | 3>(() => initialStep(assessment, canViewAssessmentResults));
+
+  const currentStandard = standards.find((s) => s.id === assessment.standardId);
+  const currentControls = currentStandard ? allControls[currentStandard.id] || [] : [];
+  const controlsCountForStandard = currentControls.length;
+
+  const [step, setStep] = useState<1 | 2 | 3>(() =>
+    initialStep(assessment, canViewAssessmentResults, controlsCountForStandard)
+  );
   const [evidenceText, setEvidenceText] = useState(() => assessment.evidenceText ?? '');
   const [isDragging, setIsDragging] = useState(false);
   const [isReadingFile, setIsReadingFile] = useState(false);
   const [isPrechecking, setIsPrechecking] = useState(false);
+  const [reportSummaryStatus, setReportSummaryStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [reportSummaryText, setReportSummaryText] = useState('');
+  const [reportSummaryError, setReportSummaryError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const runAnalysisLoopRef = useRef<(opts: { clearFindings: boolean }) => Promise<void>>(async () => {});
-
-  const currentStandard = standards.find(s => s.id === assessment.standardId);
-  const currentControls = currentStandard ? (allControls[currentStandard.id] || []) : [];
+  const summaryGenIdRef = useRef(0);
 
   const inProgressRun =
     assessment.status === 'In Progress' &&
@@ -267,16 +343,92 @@ export default function AssessmentFlow({
       ? currentControls[assessment.findings.length]?.id ?? null
       : null;
 
+  const findingsFp = useMemo(
+    () => findingsSummaryFingerprint(assessment.standardId, assessment.findings),
+    [assessment.standardId, assessment.findings]
+  );
+
+  const controlIdsKey = useMemo(() => {
+    if (!currentStandard) return '';
+    return (allControls[currentStandard.id] || []).map((c) => c.id).join('|');
+  }, [currentStandard?.id, allControls]);
+
   useEffect(() => {
     setEvidenceText(assessment.evidenceText ?? '');
-    setStep(initialStep(assessment, canViewAssessmentResults));
-  }, [assessment.id, canViewAssessmentResults]);
+    setStep(initialStep(assessment, canViewAssessmentResults, controlsCountForStandard));
+  }, [
+    assessment.id,
+    assessment.standardId,
+    assessment.status,
+    assessment.findings.length,
+    assessment.evidenceText,
+    canViewAssessmentResults,
+    controlsCountForStandard,
+  ]);
 
   useEffect(() => {
     if (assessment.status === 'Completed' && assessment.findings.length > 0 && canViewAssessmentResults) {
       setStep(3);
     }
   }, [assessment.status, assessment.findings.length, assessment.id, canViewAssessmentResults]);
+
+  useEffect(() => {
+    setReportSummaryStatus('idle');
+    setReportSummaryText('');
+    setReportSummaryError(null);
+    summaryGenIdRef.current += 1;
+  }, [assessment.id]);
+
+  useEffect(() => {
+    if (step !== 3 || !canViewAssessmentResults) return;
+    if (controlsCountForStandard === 0) return;
+    if (assessment.findings.length < controlsCountForStandard) return;
+
+    const cacheKey = `${assessment.id}:${findingsFp}`;
+    const cached = loadExecSummaryCache()[cacheKey];
+    if (cached?.text?.trim()) {
+      setReportSummaryText(cached.text);
+      setReportSummaryStatus('ready');
+      setReportSummaryError(null);
+      return;
+    }
+
+    const genId = ++summaryGenIdRef.current;
+    setReportSummaryStatus('loading');
+    setReportSummaryError(null);
+    setReportSummaryText('');
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const text = await generateExecutiveSummary(
+          currentStandard?.name || '',
+          assessment.findings,
+          currentControls
+        );
+        if (cancelled || genId !== summaryGenIdRef.current) return;
+        setReportSummaryText(text);
+        setReportSummaryStatus('ready');
+        saveExecSummaryCacheEntry(cacheKey, text);
+      } catch (e) {
+        if (cancelled || genId !== summaryGenIdRef.current) return;
+        setReportSummaryStatus('error');
+        setReportSummaryError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    step,
+    canViewAssessmentResults,
+    assessment.id,
+    findingsFp,
+    controlIdsKey,
+    controlsCountForStandard,
+    currentStandard?.name,
+  ]);
 
   useEffect(() => {
     if (!canViewAssessmentResults) {
@@ -505,7 +657,9 @@ export default function AssessmentFlow({
       }));
       cache[inputFingerprint] = { findings: findingsSoFar, ts: Date.now() };
       saveAnalysisCache(cache);
-      if (canViewAssessmentResults && qualityGate.publishable) {
+      const fullCoverage =
+        currentControls.length > 0 && findingsSoFar.length >= currentControls.length;
+      if (canViewAssessmentResults && fullCoverage) {
         setStep(3);
       }
     } finally {
@@ -519,8 +673,18 @@ export default function AssessmentFlow({
 
   const handleExport = async (format: 'excel' | 'word' | 'pdf') => {
     if (!canViewAssessmentResults) return;
-    const summary = await generateExecutiveSummary(currentStandard?.name || "", assessment.findings, currentControls);
-    
+    let summary = '';
+    if (format === 'word') {
+      summary =
+        reportSummaryStatus === 'ready' && reportSummaryText.trim()
+          ? reportSummaryText
+          : await generateExecutiveSummary(
+              currentStandard?.name || '',
+              assessment.findings,
+              currentControls
+            );
+    }
+
     if (format === 'excel') EXPORT_SERVICE.exportToExcel(assessment.findings, currentControls, currentStandard?.name || "");
     if (format === 'word') EXPORT_SERVICE.exportToWord(assessment.findings, currentControls, currentStandard?.name || "", summary);
     if (format === 'pdf') EXPORT_SERVICE.exportToPDF(assessment.findings, currentControls, currentStandard?.name || "");
@@ -529,6 +693,31 @@ export default function AssessmentFlow({
       assessmentId: assessment.id,
       standardId: assessment.standardId,
     }).catch(() => {});
+  };
+
+  const retryExecutiveSummary = async () => {
+    if (!canViewAssessmentResults) return;
+    if (controlsCountForStandard === 0 || assessment.findings.length < controlsCountForStandard) return;
+    const cacheKey = `${assessment.id}:${findingsFp}`;
+    const genId = ++summaryGenIdRef.current;
+    setReportSummaryStatus('loading');
+    setReportSummaryError(null);
+    setReportSummaryText('');
+    try {
+      const text = await generateExecutiveSummary(
+        currentStandard?.name || '',
+        assessment.findings,
+        currentControls
+      );
+      if (genId !== summaryGenIdRef.current) return;
+      setReportSummaryText(text);
+      setReportSummaryStatus('ready');
+      saveExecSummaryCacheEntry(cacheKey, text);
+    } catch (e) {
+      if (genId !== summaryGenIdRef.current) return;
+      setReportSummaryStatus('error');
+      setReportSummaryError(e instanceof Error ? e.message : String(e));
+    }
   };
 
   return (
@@ -819,14 +1008,18 @@ export default function AssessmentFlow({
           {assessment.findings.length > 0 && !isAnalyzing && (
             <>
               {canViewAssessmentResults ? (
-                <motion.button
-                  initial={{ opacity: 0, scale: 0.9 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  onClick={() => setStep(3)}
-                  className="glass-button w-full mt-12 py-5 text-xl font-black bg-success-main shadow-success-main/20"
-                >
-                  {t('final')}
-                </motion.button>
+                <div className="mt-12 flex flex-col items-center gap-3 text-center">
+                  <p className="text-xs font-medium text-text-main/55 max-w-xl leading-relaxed">
+                    {t('reportAutoNavHint')}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setStep(3)}
+                    className="text-sm font-black text-accent underline-offset-4 hover:underline"
+                  >
+                    {t('openReportSecondary')}
+                  </button>
+                </div>
               ) : (
                 <div className="glass-card w-full mt-12 p-8 border border-warning-main/25 bg-warning-main/5">
                   <p className="text-center font-black text-lg text-text-main">{t('done')}</p>
@@ -847,6 +1040,73 @@ export default function AssessmentFlow({
           animate={{ opacity: 1, scale: 1 }}
           className="space-y-10"
         >
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <button
+              type="button"
+              onClick={() => setStep(2)}
+              className="text-sm font-black text-text-main/60 hover:text-accent transition-colors"
+            >
+              ← {t('backToGapAnalysis')}
+            </button>
+          </div>
+
+          {assessment.status === 'Draft' ? (
+            <div className="glass-card border border-warning-main/30 bg-warning-main/5 p-5 text-sm text-text-main/85">
+              <p className="font-black text-warning-main mb-1 flex items-center gap-2">
+                <AlertCircle size={18} />
+                {t('autoDraftBadge')}
+              </p>
+              <p className="leading-relaxed">{t('draftQualityBanner')}</p>
+              {assessment.quality?.issues && assessment.quality.issues.length > 0 ? (
+                <p className="mt-2 text-xs font-mono text-text-main/55">
+                  {assessment.quality.issues.join(locale === 'en-US' ? '; ' : '；')}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+
+          <div className="glass-card p-8 border border-white/40 space-y-4">
+            <h4 className="text-[10px] font-black text-accent uppercase tracking-widest flex items-center gap-2">
+              <FileText size={14} />
+              {t('execSummaryTitle')}
+            </h4>
+            {controlsCountForStandard > 0 && assessment.findings.length < controlsCountForStandard ? (
+              <p className="text-sm font-medium text-text-main/65 py-2">{t('execSummaryWaitingControls')}</p>
+            ) : null}
+            {(reportSummaryStatus === 'loading' ||
+              (reportSummaryStatus === 'idle' &&
+                controlsCountForStandard > 0 &&
+                assessment.findings.length >= controlsCountForStandard)) ? (
+              <div className="flex items-center gap-3 py-6 text-text-main/80">
+                <Loader2 size={22} className="animate-spin text-accent" />
+                <span className="font-bold">{t('execSummaryGenerating')}</span>
+              </div>
+            ) : null}
+            {reportSummaryStatus === 'ready' && reportSummaryText.trim() ? (
+              <div className="space-y-2">
+                <p className="text-xs font-black text-success-main flex items-center gap-2">
+                  <CheckCircle2 size={16} />
+                  {t('execSummaryReady')}
+                </p>
+                <div className="text-sm leading-relaxed text-text-main/85 whitespace-pre-wrap max-h-[min(50vh,28rem)] overflow-y-auto pr-1">
+                  {reportSummaryText}
+                </div>
+              </div>
+            ) : null}
+            {reportSummaryStatus === 'error' ? (
+              <div className="space-y-3">
+                <p className="text-sm text-danger-main font-bold">{reportSummaryError || '—'}</p>
+                <button
+                  type="button"
+                  onClick={() => void retryExecutiveSummary()}
+                  className="glass-button px-5 py-2.5 text-sm font-black border border-accent/40 text-accent"
+                >
+                  {t('execSummaryRetry')}
+                </button>
+              </div>
+            ) : null}
+          </div>
+
           <div className="flex flex-col lg:flex-row justify-between items-start gap-10 glass-card p-10">
             <div className="flex-1">
               <div className="inline-flex items-center gap-2 px-3 py-1 bg-accent/10 rounded-full text-[10px] font-black text-accent uppercase tracking-widest mb-4">
