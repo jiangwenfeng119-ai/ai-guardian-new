@@ -14,6 +14,7 @@ import {
 import {
   apiHealth,
   fetchAuditLog,
+  fetchUserActivityAnalytics,
   fetchSettings,
   postLegalRegulationsFetch,
   postModelConnectionTest,
@@ -217,7 +218,7 @@ function formatAuditTsChina(entry: unknown, locale: 'zh-CN' | 'en-US' = 'zh-CN')
 
 function defaultSettingsTab(p: Record<PermissionKey, boolean>): SettingsTabId {
   if (p.manageUsers) return 'baseInfo';
-  if (p.configureAiModel || p.syncStandardsApi) return 'ai';
+  if (p.configureAiModel || p.editStandards) return 'ai';
   if (p.viewAuditLog) return 'audit';
   if (p.viewAppAbout) return 'about';
   return 'baseInfo';
@@ -305,6 +306,12 @@ export default function SystemSettings({
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditQuickFilter, setAuditQuickFilter] = useState<AuditQuickFilter>('all');
   const [auditTimeWindow, setAuditTimeWindow] = useState<AuditTimeWindow>('all');
+  const [activityDays, setActivityDays] = useState<7 | 30 | 90>(30);
+  const [activityRole, setActivityRole] = useState<string>('all');
+  const [activityCompanyId, setActivityCompanyId] = useState<string>('all');
+  const [activityProjectId, setActivityProjectId] = useState<string>('all');
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityData, setActivityData] = useState<Awaited<ReturnType<typeof fetchUserActivityAnalytics>> | null>(null);
   const [selectedAuditCategories, setSelectedAuditCategories] = useState<AuditCategoryId[]>([
     'modelRuntime',
     'auth',
@@ -326,7 +333,7 @@ export default function SystemSettings({
     }) => {
       const tracked: Record<string, unknown> = {};
       if (effectivePermissions.configureAiModel) tracked.model = payload.model;
-      if (effectivePermissions.syncStandardsApi) tracked.sync = payload.sync;
+      if (effectivePermissions.editStandards) tracked.sync = payload.sync;
       if (effectivePermissions.manageUsers) {
         tracked.permissions = payload.permissions;
         tracked.baseInfo = payload.baseInfo;
@@ -483,11 +490,49 @@ export default function SystemSettings({
     }
   }, [backendReady, effectivePermissions.viewAuditLog, onSessionExpired, tx]);
 
+  const refreshUserActivity = useCallback(async () => {
+    if (!backendReady || !effectivePermissions.viewAuditLog) return;
+    setActivityLoading(true);
+    try {
+      const out = await fetchUserActivityAnalytics({
+        days: activityDays,
+        role: activityRole,
+        companyId: activityCompanyId,
+        projectId: activityProjectId,
+        limit: 200,
+      });
+      setActivityData(out);
+    } catch (e) {
+      if (e instanceof Error && e.message === 'SESSION_EXPIRED') {
+        onSessionExpired();
+        return;
+      }
+      setErrorNotice(e instanceof Error ? e.message : tx('加载用户活跃度失败', 'Failed to load user activity'));
+    } finally {
+      setActivityLoading(false);
+    }
+  }, [
+    backendReady,
+    effectivePermissions.viewAuditLog,
+    activityDays,
+    activityRole,
+    activityCompanyId,
+    activityProjectId,
+    onSessionExpired,
+    tx,
+  ]);
+
   useEffect(() => {
     if (activeTab === 'audit' && backendReady && effectivePermissions.viewAuditLog) {
       void refreshAudit();
     }
   }, [activeTab, backendReady, effectivePermissions.viewAuditLog, refreshAudit]);
+
+  useEffect(() => {
+    if (activeTab === 'audit' && backendReady && effectivePermissions.viewAuditLog) {
+      void refreshUserActivity();
+    }
+  }, [activeTab, backendReady, effectivePermissions.viewAuditLog, refreshUserActivity]);
 
   const saveAllSettings = async () => {
     setErrorNotice(null);
@@ -513,7 +558,7 @@ export default function SystemSettings({
         openaiApiKey: modelSettings.cloudModel?.openaiApiKey || modelSettings.openaiApiKey,
       };
     }
-    if (can('syncStandardsApi')) body.sync = apiSyncSettings;
+    if (can('editStandards')) body.sync = apiSyncSettings;
     if (can('manageUsers')) {
       body.permissions = permissionMatrix;
       body.baseInfo = baseInfoSettings;
@@ -757,7 +802,7 @@ export default function SystemSettings({
   };
 
   const showSaveAllSettings =
-    can('configureAiModel') || can('syncStandardsApi') || can('manageUsers');
+    can('configureAiModel') || can('editStandards') || can('manageUsers');
   const hasUnsavedChanges = showSaveAllSettings && savedTrackedSignature !== currentTrackedSignature;
 
   const testModelConnection = async (ensureReady = false, target: 'primary' | 'local' | 'cloud' | 'all' = 'primary') => {
@@ -799,7 +844,7 @@ export default function SystemSettings({
 
   const showBaseInfoTab = can('manageUsers');
   const showUsersTab = can('manageUsers');
-  const showAiTab = can('configureAiModel') || can('syncStandardsApi');
+  const showAiTab = can('configureAiModel') || can('editStandards');
   const showAuditTab = can('viewAuditLog');
   const showAboutTab = can('viewAppAbout');
   const hasAnySettingsTab = showBaseInfoTab || showUsersTab || showAiTab || showAuditTab || showAboutTab;
@@ -1724,6 +1769,126 @@ export default function SystemSettings({
             <p className="text-sm text-text-main/50">{tx('暂无记录', 'No records')}</p>
           ) : (
             <>
+              <div className="rounded-xl border border-black/10 bg-white/70 p-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <h4 className="text-sm font-black uppercase tracking-widest text-text-main/55">
+                    {tx('用户活跃度分析', 'User Activity Analytics')}
+                  </h4>
+                  <button
+                    type="button"
+                    onClick={() => void refreshUserActivity()}
+                    disabled={activityLoading}
+                    className="glass-card px-3 py-1.5 text-[11px] font-black uppercase tracking-widest disabled:opacity-50"
+                  >
+                    {activityLoading ? tx('加载中…', 'Loading...') : tx('刷新活跃度', 'Refresh activity')}
+                  </button>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    className="glass-input px-3 py-2 text-xs font-semibold"
+                    value={activityDays}
+                    onChange={(e) => setActivityDays(Number(e.target.value) as 7 | 30 | 90)}
+                  >
+                    <option value={7}>{tx('近 7 天', 'Last 7 days')}</option>
+                    <option value={30}>{tx('近 30 天', 'Last 30 days')}</option>
+                    <option value={90}>{tx('近 90 天', 'Last 90 days')}</option>
+                  </select>
+                  <select
+                    className="glass-input px-3 py-2 text-xs font-semibold"
+                    value={activityRole}
+                    onChange={(e) => setActivityRole(e.target.value)}
+                  >
+                    <option value="all">{tx('全部角色', 'All roles')}</option>
+                    {ROLES.map((r) => (
+                      <option key={r} value={r}>
+                        {roleLabels[r]}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="glass-input px-3 py-2 text-xs font-semibold"
+                    value={activityCompanyId}
+                    onChange={(e) => setActivityCompanyId(e.target.value)}
+                  >
+                    <option value="all">{tx('全部公司', 'All companies')}</option>
+                    {baseInfoSettings.companies.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name || c.id}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="glass-input px-3 py-2 text-xs font-semibold"
+                    value={activityProjectId}
+                    onChange={(e) => setActivityProjectId(e.target.value)}
+                  >
+                    <option value="all">{tx('全部项目', 'All projects')}</option>
+                    {baseInfoSettings.projects.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name || p.id}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {activityData && (
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+                    <div className="rounded-lg border border-black/10 bg-white/70 p-2">
+                      <p className="text-[10px] text-text-main/45 font-black uppercase">{tx('活跃用户', 'Active users')}</p>
+                      <p className="text-lg font-black">{activityData.summary.activeUsers}</p>
+                    </div>
+                    <div className="rounded-lg border border-black/10 bg-white/70 p-2">
+                      <p className="text-[10px] text-text-main/45 font-black uppercase">{tx('活跃占比', 'Active ratio')}</p>
+                      <p className="text-lg font-black">{Math.round(activityData.summary.activeUserRatio * 100)}%</p>
+                    </div>
+                    <div className="rounded-lg border border-black/10 bg-white/70 p-2">
+                      <p className="text-[10px] text-text-main/45 font-black uppercase">{tx('登录次数', 'Logins')}</p>
+                      <p className="text-lg font-black">{activityData.summary.totalLoginOk}</p>
+                    </div>
+                    <div className="rounded-lg border border-black/10 bg-white/70 p-2">
+                      <p className="text-[10px] text-text-main/45 font-black uppercase">{tx('发起评估', 'Assessments')}</p>
+                      <p className="text-lg font-black">{activityData.summary.totalAssessmentsCreated}</p>
+                    </div>
+                    <div className="rounded-lg border border-black/10 bg-white/70 p-2">
+                      <p className="text-[10px] text-text-main/45 font-black uppercase">{tx('下载报告', 'Downloads')}</p>
+                      <p className="text-lg font-black">{activityData.summary.totalReportsDownloaded}</p>
+                    </div>
+                  </div>
+                )}
+                {activityData && (
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[900px] text-xs">
+                      <thead>
+                        <tr className="text-left text-text-main/50">
+                          <th className="py-2 pr-2">{tx('用户', 'User')}</th>
+                          <th className="py-2 pr-2">{tx('角色', 'Role')}</th>
+                          <th className="py-2 pr-2">{tx('活跃分', 'Score')}</th>
+                          <th className="py-2 pr-2">{tx('登录', 'Logins')}</th>
+                          <th className="py-2 pr-2">{tx('评估', 'Assessments')}</th>
+                          <th className="py-2 pr-2">{tx('下载', 'Downloads')}</th>
+                          <th className="py-2 pr-2">{tx('标准更新', 'Standards')}</th>
+                          <th className="py-2 pr-2">{tx('活跃天数', 'Active days')}</th>
+                          <th className="py-2 pr-2">{tx('最近活跃', 'Last active')}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {activityData.users.map((u) => (
+                          <tr key={u.userId} className="border-t border-black/10">
+                            <td className="py-2 pr-2 font-semibold">{u.username}</td>
+                            <td className="py-2 pr-2">{u.role}</td>
+                            <td className="py-2 pr-2 font-black">{u.activityScore}</td>
+                            <td className="py-2 pr-2">{u.loginOkCount}</td>
+                            <td className="py-2 pr-2">{u.assessmentsCreatedCount}</td>
+                            <td className="py-2 pr-2">{u.reportsDownloadedCount}</td>
+                            <td className="py-2 pr-2">{u.standardsUpdatedCount}</td>
+                            <td className="py-2 pr-2">{u.activeDays}</td>
+                            <td className="py-2 pr-2">{u.lastActiveAt ? formatAuditTsChina({ ts: u.lastActiveAt }, uiLocale) : '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"

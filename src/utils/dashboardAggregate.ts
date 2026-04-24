@@ -7,7 +7,7 @@ export function standardShortLabel(
   extraCatalog: StandardCatalogEntry[] = []
 ): string {
   const entry =
-    STANDARDS_CATALOG.find((s) => s.id === standardId) ?? extraCatalog.find((s) => s.id === standardId);
+    extraCatalog.find((s) => s.id === standardId) ?? STANDARDS_CATALOG.find((s) => s.id === standardId);
   const raw = entry?.name ?? standardId;
   return raw.length <= maxLen ? raw : `${raw.slice(0, maxLen - 1)}…`;
 }

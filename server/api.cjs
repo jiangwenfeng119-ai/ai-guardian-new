@@ -40,7 +40,6 @@ const DEFAULT_PERMISSION_MATRIX = {
     manageUsers: true,
     editStandards: true,
     runAssessments: true,
-    syncStandardsApi: true,
     exportReports: true,
     configureAiModel: true,
     viewAuditLog: true,
@@ -52,7 +51,6 @@ const DEFAULT_PERMISSION_MATRIX = {
     manageUsers: false,
     editStandards: true,
     runAssessments: true,
-    syncStandardsApi: true,
     exportReports: true,
     configureAiModel: true,
     viewAuditLog: true,
@@ -64,7 +62,6 @@ const DEFAULT_PERMISSION_MATRIX = {
     manageUsers: false,
     editStandards: false,
     runAssessments: true,
-    syncStandardsApi: false,
     exportReports: true,
     configureAiModel: false,
     viewAuditLog: true,
@@ -76,7 +73,6 @@ const DEFAULT_PERMISSION_MATRIX = {
     manageUsers: false,
     editStandards: false,
     runAssessments: true,
-    syncStandardsApi: false,
     exportReports: true,
     configureAiModel: false,
     viewAuditLog: false,
@@ -88,7 +84,6 @@ const DEFAULT_PERMISSION_MATRIX = {
     manageUsers: false,
     editStandards: false,
     runAssessments: false,
-    syncStandardsApi: false,
     exportReports: false,
     configureAiModel: false,
     viewAuditLog: false,
@@ -155,7 +150,24 @@ const DEFAULT_SETTINGS = {
     projects: [],
     teams: [],
   },
+  standardsLibrary: {
+    catalogEntries: [],
+    controls: {},
+  },
   permissions: null,
+  assessmentQuality: {
+    maxAssessmentsPerRequest: 200,
+    maxEvidenceChars: 200000,
+    minEvidenceChars: 120,
+    minDistinctEvidenceChars: 80,
+    minCoverageRatioForPublish: 0.7,
+    minEvidencePerFindingChars: 20,
+    minUniqueEvidenceRatio: 0.35,
+    maxFindingTextChars: 15000,
+    maxNameChars: 160,
+    maxProjectLabelChars: 80,
+    maxIdChars: 120,
+  },
 };
 
 function ensureDataDir() {
@@ -200,6 +212,10 @@ function readSettings() {
       },
       sync: { ...DEFAULT_SETTINGS.sync, ...(parsed.sync || {}) },
       baseInfo: { ...DEFAULT_SETTINGS.baseInfo, ...(parsed.baseInfo || {}) },
+      standardsLibrary: {
+        ...DEFAULT_SETTINGS.standardsLibrary,
+        ...((parsed && parsed.standardsLibrary) || {}),
+      },
     };
   } catch (e) {
     console.error('readSettings failed', e);
@@ -289,6 +305,239 @@ function readAuditTail(limit = 50) {
   });
 }
 
+function readAuditAll() {
+  ensureDataDir();
+  if (!fs.existsSync(AUDIT_PATH)) return [];
+  try {
+    const content = fs.readFileSync(AUDIT_PATH, 'utf8');
+    return content
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch (e) {
+    console.error('readAuditAll failed', e);
+    return [];
+  }
+}
+
+function toIsoDay(tsLike) {
+  const ms = Date.parse(String(tsLike || ''));
+  if (!Number.isFinite(ms)) return '';
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function safeCount(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.round(n);
+}
+
+function buildUserActivityAnalytics({ days = 30, role = 'all', companyId = 'all', projectId = 'all', limit = 200 }) {
+  const allAudit = readAuditAll();
+  const { users } = readUsers();
+  const userById = new Map(users.map((u) => [String(u.id), u]));
+  const userIdByUsername = new Map(users.map((u) => [String(u.username || '').toLowerCase(), String(u.id)]));
+  const now = Date.now();
+  const windowMs = Math.max(1, Number(days) || 30) * 24 * 60 * 60 * 1000;
+  const sinceMs = now - windowMs;
+  const sinceIso = new Date(sinceMs).toISOString();
+  const byDay = new Map();
+  const bucketByUser = new Map();
+
+  const ensureBucket = (userId) => {
+    if (!bucketByUser.has(userId)) {
+      const profile = userById.get(userId);
+      bucketByUser.set(userId, {
+        userId,
+        username: String(profile?.username || userId),
+        role: String(profile?.role || 'Unknown'),
+        companyId: String(profile?.companyId || ''),
+        projectId: String(profile?.projectId || ''),
+        loginOkCount: 0,
+        loginFailCount: 0,
+        assessmentsCreatedCount: 0,
+        assessmentsSavedCount: 0,
+        reportsDownloadedCount: 0,
+        standardsUpdatedCount: 0,
+        settingsUpdatedCount: 0,
+        activeDaysSet: new Set(),
+        lastActiveAt: '',
+        avgSessionGapHours: null,
+        _lastEventTs: null,
+        _sessionGapTotalMs: 0,
+        _sessionGapCount: 0,
+      });
+    }
+    return bucketByUser.get(userId);
+  };
+
+  const resolveUserId = (entry) => {
+    const detail = entry && entry.detail && typeof entry.detail === 'object' ? entry.detail : {};
+    const fromDetailId = String(detail.userId || '').trim();
+    if (fromDetailId && userById.has(fromDetailId)) return fromDetailId;
+    const actor = String(entry.actor || '').trim().toLowerCase();
+    if (actor && userIdByUsername.has(actor)) return userIdByUsername.get(actor);
+    const detailUsername = String(detail.username || '').trim().toLowerCase();
+    if (detailUsername && userIdByUsername.has(detailUsername)) return userIdByUsername.get(detailUsername);
+    return '';
+  };
+
+  for (const entry of allAudit) {
+    const ts = Date.parse(String(entry?.ts || ''));
+    if (!Number.isFinite(ts) || ts < sinceMs) continue;
+    const action = String(entry?.action || '').trim();
+    if (!action) continue;
+    const day = toIsoDay(entry.ts);
+    if (day) {
+      if (!byDay.has(day)) {
+        byDay.set(day, {
+          day,
+          activeUsers: new Set(),
+          loginCount: 0,
+          assessmentCreatedCount: 0,
+          reportDownloadedCount: 0,
+          standardsUpdatedCount: 0,
+        });
+      }
+    }
+    const userId = resolveUserId(entry);
+    if (!userId) continue;
+    const bucket = ensureBucket(userId);
+    if (bucket._lastEventTs && ts > bucket._lastEventTs) {
+      const delta = ts - bucket._lastEventTs;
+      if (delta <= 8 * 60 * 60 * 1000) {
+        bucket._sessionGapTotalMs += delta;
+        bucket._sessionGapCount += 1;
+      }
+    }
+    bucket._lastEventTs = ts;
+    if (day) {
+      bucket.activeDaysSet.add(day);
+      byDay.get(day).activeUsers.add(userId);
+    }
+    if (!bucket.lastActiveAt || String(entry.ts) > bucket.lastActiveAt) {
+      bucket.lastActiveAt = String(entry.ts);
+    }
+    if (action === 'auth.login.ok') {
+      bucket.loginOkCount += 1;
+      if (day) byDay.get(day).loginCount += 1;
+    } else if (action === 'auth.login.fail') {
+      bucket.loginFailCount += 1;
+    } else if (action === 'assessments.create') {
+      bucket.assessmentsCreatedCount += safeCount(entry?.detail?.count || 1);
+      if (day) byDay.get(day).assessmentCreatedCount += safeCount(entry?.detail?.count || 1);
+    } else if (action === 'assessments.save') {
+      bucket.assessmentsSavedCount += safeCount(entry?.detail?.count || 1);
+    } else if (action === 'reports.download') {
+      bucket.reportsDownloadedCount += 1;
+      if (day) byDay.get(day).reportDownloadedCount += 1;
+    } else if (action === 'standards.update') {
+      bucket.standardsUpdatedCount += 1;
+      if (day) byDay.get(day).standardsUpdatedCount += 1;
+    } else if (action === 'settings.save') {
+      bucket.settingsUpdatedCount += 1;
+    }
+  }
+
+  const filtered = Array.from(bucketByUser.values()).filter((u) => {
+    if (role !== 'all' && u.role !== role) return false;
+    if (companyId !== 'all' && String(u.companyId || '') !== companyId) return false;
+    if (projectId !== 'all' && String(u.projectId || '') !== projectId) return false;
+    return true;
+  });
+
+  const maxLogin = Math.max(1, ...filtered.map((u) => u.loginOkCount));
+  const maxAssess = Math.max(1, ...filtered.map((u) => u.assessmentsCreatedCount + u.assessmentsSavedCount));
+  const maxReport = Math.max(1, ...filtered.map((u) => u.reportsDownloadedCount));
+  const maxStd = Math.max(1, ...filtered.map((u) => u.standardsUpdatedCount + u.settingsUpdatedCount));
+
+  const usersOut = filtered
+    .map((u) => {
+      const loginScore = u.loginOkCount / maxLogin;
+      const assessmentScore = (u.assessmentsCreatedCount + u.assessmentsSavedCount) / maxAssess;
+      const reportScore = u.reportsDownloadedCount / maxReport;
+      const standardsScore = (u.standardsUpdatedCount + u.settingsUpdatedCount) / maxStd;
+      const activityScore = Math.round(
+        Math.min(100, 100 * (0.2 * loginScore + 0.4 * assessmentScore + 0.2 * reportScore + 0.2 * standardsScore))
+      );
+      const activeDays = u.activeDaysSet.size;
+      const loginTotal = u.loginOkCount + u.loginFailCount;
+      const loginSuccessRate = loginTotal > 0 ? Number((u.loginOkCount / loginTotal).toFixed(3)) : null;
+      const avgSessionGapHours =
+        u._sessionGapCount > 0 ? Number((u._sessionGapTotalMs / u._sessionGapCount / (60 * 60 * 1000)).toFixed(2)) : null;
+      return {
+        userId: u.userId,
+        username: u.username,
+        role: u.role,
+        companyId: u.companyId,
+        projectId: u.projectId,
+        activityScore,
+        activeLevel: activityScore >= 70 ? 'high' : activityScore >= 40 ? 'medium' : 'low',
+        activeDays,
+        lastActiveAt: u.lastActiveAt || null,
+        loginOkCount: u.loginOkCount,
+        loginFailCount: u.loginFailCount,
+        loginSuccessRate,
+        assessmentsCreatedCount: u.assessmentsCreatedCount,
+        assessmentsSavedCount: u.assessmentsSavedCount,
+        reportsDownloadedCount: u.reportsDownloadedCount,
+        standardsUpdatedCount: u.standardsUpdatedCount,
+        settingsUpdatedCount: u.settingsUpdatedCount,
+        avgSessionGapHours,
+      };
+    })
+    .sort((a, b) => b.activityScore - a.activityScore || b.activeDays - a.activeDays)
+    .slice(0, Math.max(1, Number(limit) || 200));
+
+  const trend = Array.from(byDay.values())
+    .map((d) => ({
+      day: d.day,
+      activeUsers: d.activeUsers.size,
+      loginCount: d.loginCount,
+      assessmentCreatedCount: d.assessmentCreatedCount,
+      reportDownloadedCount: d.reportDownloadedCount,
+      standardsUpdatedCount: d.standardsUpdatedCount,
+    }))
+    .sort((a, b) => a.day.localeCompare(b.day));
+
+  const scoreDist = { high: 0, medium: 0, low: 0 };
+  usersOut.forEach((u) => {
+    scoreDist[u.activeLevel] += 1;
+  });
+  const totalUsers = usersOut.length;
+  const activeUsers = usersOut.filter((u) => u.activeDays > 0).length;
+
+  return {
+    window: { days: Math.max(1, Number(days) || 30), since: sinceIso, until: new Date(now).toISOString() },
+    dimensions: { role, companyId, projectId },
+    metricDefinitions: {
+      activityScore:
+        '0-100 weighted score (login 20%, assessments 40%, report download 20%, standards/settings update 20%).',
+      loginSuccessRate: 'loginOkCount / (loginOkCount + loginFailCount), null when no login events.',
+      activeDays: 'Count of distinct UTC days with at least one tracked event.',
+    },
+    summary: {
+      totalUsers,
+      activeUsers,
+      activeUserRatio: totalUsers > 0 ? Number((activeUsers / totalUsers).toFixed(3)) : 0,
+      totalLoginOk: usersOut.reduce((acc, u) => acc + u.loginOkCount, 0),
+      totalAssessmentsCreated: usersOut.reduce((acc, u) => acc + u.assessmentsCreatedCount, 0),
+      totalReportsDownloaded: usersOut.reduce((acc, u) => acc + u.reportsDownloadedCount, 0),
+      totalStandardsUpdated: usersOut.reduce((acc, u) => acc + u.standardsUpdatedCount, 0),
+      scoreDistribution: scoreDist,
+    },
+    trend,
+    users: usersOut,
+  };
+}
+
 function readAssessmentsStore() {
   ensureDataDir();
   if (!fs.existsSync(ASSESSMENTS_PATH)) return { byUser: {} };
@@ -307,6 +556,315 @@ function readAssessmentsStore() {
 function writeAssessmentsStore(payload) {
   ensureDataDir();
   fs.writeFileSync(ASSESSMENTS_PATH, JSON.stringify(payload, null, 2), 'utf8');
+}
+
+const ASSESSMENT_STATUS_SET = new Set(['Draft', 'In Progress', 'Completed']);
+const FINDING_STATUS_SET = new Set(['Compliant', 'Partial', 'Non-Compliant', 'Not Applicable']);
+const ATTENTION_STATE_SET = new Set(['pending', 'processing', 'resolved']);
+const PLACEHOLDER_PATTERNS = [
+  /lorem ipsum/gi,
+  /todo/gi,
+  /待补充/g,
+  /tbd/gi,
+  /n\/a/gi,
+  /无/gi,
+  /暂无/gi,
+];
+const DEFAULT_ASSESSMENT_QUALITY_POLICY = {
+  maxAssessmentsPerRequest: 200,
+  maxEvidenceChars: 200000,
+  minEvidenceChars: 120,
+  minDistinctEvidenceChars: 80,
+  minCoverageRatioForPublish: 0.7,
+  minEvidencePerFindingChars: 20,
+  minUniqueEvidenceRatio: 0.35,
+  maxFindingTextChars: 15000,
+  maxNameChars: 160,
+  maxProjectLabelChars: 80,
+  maxIdChars: 120,
+};
+
+function clampInt(n, min, max, fallback) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(v)));
+}
+
+function clampNumber(n, min, max, fallback) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.min(max, Math.max(min, v));
+}
+
+function getAssessmentQualityPolicy(settings) {
+  const raw =
+    settings &&
+    settings.assessmentQuality &&
+    typeof settings.assessmentQuality === 'object' &&
+    !Array.isArray(settings.assessmentQuality)
+      ? settings.assessmentQuality
+      : {};
+  return {
+    maxAssessmentsPerRequest: clampInt(
+      raw.maxAssessmentsPerRequest,
+      1,
+      1000,
+      DEFAULT_ASSESSMENT_QUALITY_POLICY.maxAssessmentsPerRequest
+    ),
+    maxEvidenceChars: clampInt(raw.maxEvidenceChars, 5000, 1000000, DEFAULT_ASSESSMENT_QUALITY_POLICY.maxEvidenceChars),
+    minEvidenceChars: clampInt(raw.minEvidenceChars, 0, 5000, DEFAULT_ASSESSMENT_QUALITY_POLICY.minEvidenceChars),
+    minDistinctEvidenceChars: clampInt(
+      raw.minDistinctEvidenceChars,
+      0,
+      5000,
+      DEFAULT_ASSESSMENT_QUALITY_POLICY.minDistinctEvidenceChars
+    ),
+    minCoverageRatioForPublish: clampNumber(
+      raw.minCoverageRatioForPublish,
+      0,
+      1,
+      DEFAULT_ASSESSMENT_QUALITY_POLICY.minCoverageRatioForPublish
+    ),
+    minEvidencePerFindingChars: clampInt(
+      raw.minEvidencePerFindingChars,
+      0,
+      500,
+      DEFAULT_ASSESSMENT_QUALITY_POLICY.minEvidencePerFindingChars
+    ),
+    minUniqueEvidenceRatio: clampNumber(
+      raw.minUniqueEvidenceRatio,
+      0,
+      1,
+      DEFAULT_ASSESSMENT_QUALITY_POLICY.minUniqueEvidenceRatio
+    ),
+    maxFindingTextChars: clampInt(
+      raw.maxFindingTextChars,
+      200,
+      50000,
+      DEFAULT_ASSESSMENT_QUALITY_POLICY.maxFindingTextChars
+    ),
+    maxNameChars: clampInt(raw.maxNameChars, 20, 500, DEFAULT_ASSESSMENT_QUALITY_POLICY.maxNameChars),
+    maxProjectLabelChars: clampInt(
+      raw.maxProjectLabelChars,
+      20,
+      200,
+      DEFAULT_ASSESSMENT_QUALITY_POLICY.maxProjectLabelChars
+    ),
+    maxIdChars: clampInt(raw.maxIdChars, 20, 200, DEFAULT_ASSESSMENT_QUALITY_POLICY.maxIdChars),
+  };
+}
+
+function normalizeWs(input) {
+  return String(input || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function calcEvidenceMetrics(evidenceText) {
+  const raw = String(evidenceText || '');
+  const trimmed = raw.trim();
+  const normalized = normalizeWs(raw);
+  const chars = trimmed.length;
+  const distinctChars = new Set(normalized.replace(/\s+/g, '').split('')).size;
+  const lines = raw
+    .split('\n')
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const uniqueLines = new Set(lines.map((x) => x.toLowerCase())).size;
+  const uniqueLineRatio = lines.length > 0 ? uniqueLines / lines.length : 0;
+  const placeholderHits = PLACEHOLDER_PATTERNS.reduce((acc, p) => acc + (normalized.match(p) || []).length, 0);
+  return {
+    chars,
+    distinctChars,
+    lines: lines.length,
+    uniqueLines,
+    uniqueLineRatio,
+    placeholderHits,
+    normalized,
+  };
+}
+
+function calculateCoverageRatio(assessment, settings) {
+  const findings = Array.isArray(assessment.findings) ? assessment.findings : [];
+  const stdId = String(assessment.standardId || '').trim();
+  const controlsMap =
+    settings &&
+    settings.standardsLibrary &&
+    settings.standardsLibrary.controls &&
+    typeof settings.standardsLibrary.controls === 'object'
+      ? settings.standardsLibrary.controls
+      : {};
+  const controlList = Array.isArray(controlsMap[stdId]) ? controlsMap[stdId] : [];
+  const totalControls = controlList.length;
+  if (totalControls <= 0) {
+    return { totalControls: 0, assessedControls: findings.length, ratio: findings.length > 0 ? 1 : 0 };
+  }
+  const covered = new Set(findings.map((f) => String(f && f.controlId ? f.controlId : '').trim()).filter(Boolean)).size;
+  return {
+    totalControls,
+    assessedControls: covered,
+    ratio: Math.min(1, covered / totalControls),
+  };
+}
+
+function hashAssessmentInput(assessment) {
+  const findings = Array.isArray(assessment.findings) ? assessment.findings : [];
+  const stableFindings = findings
+    .map((f) => ({
+      controlId: String(f?.controlId || '').trim(),
+      status: String(f?.status || '').trim(),
+      evidence: normalizeWs(String(f?.evidence || '')).slice(0, 500),
+      analysis: normalizeWs(String(f?.analysis || '')).slice(0, 500),
+      recommendation: normalizeWs(String(f?.recommendation || '')).slice(0, 500),
+    }))
+    .sort((a, b) => `${a.controlId}|${a.status}`.localeCompare(`${b.controlId}|${b.status}`));
+  const payload = {
+    standardId: String(assessment?.standardId || '').trim(),
+    evidence: normalizeWs(String(assessment?.evidenceText || '')),
+    findings: stableFindings,
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+}
+
+function validateFindingShape(raw, idx, fIdx, policy) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, error: `第 ${idx + 1} 条任务的 findings[${fIdx}] 不是对象` };
+  }
+  const controlId = String(raw.controlId || '').trim();
+  const status = String(raw.status || '').trim();
+  const attentionState = String(raw.attentionState || '').trim();
+  const evidence = String(raw.evidence || '').trim();
+  const analysis = String(raw.analysis || '').trim();
+  const recommendation = String(raw.recommendation || '').trim();
+  if (!controlId) return { ok: false, error: `第 ${idx + 1} 条任务的 findings[${fIdx}] 缺少 controlId` };
+  if (!FINDING_STATUS_SET.has(status)) {
+    return { ok: false, error: `第 ${idx + 1} 条任务的 findings[${fIdx}] status 非法` };
+  }
+  if (attentionState && !ATTENTION_STATE_SET.has(attentionState)) {
+    return { ok: false, error: `第 ${idx + 1} 条任务的 findings[${fIdx}] attentionState 非法` };
+  }
+  if (
+    evidence.length > policy.maxFindingTextChars ||
+    analysis.length > policy.maxFindingTextChars ||
+    recommendation.length > policy.maxFindingTextChars
+  ) {
+    return { ok: false, error: `第 ${idx + 1} 条任务的 findings[${fIdx}] 文本超长` };
+  }
+  return {
+    ok: true,
+    value: {
+      controlId,
+      status,
+      attentionState: attentionState || undefined,
+      evidence,
+      analysis,
+      recommendation,
+    },
+  };
+}
+
+function validateAssessmentRecord(raw, idx, policy, settings) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, error: `第 ${idx + 1} 条任务不是对象` };
+  }
+  const id = String(raw.id || '').trim();
+  const name = String(raw.name || '').trim();
+  const standardId = String(raw.standardId || '').trim();
+  const status = String(raw.status || '').trim();
+  const createdAt = String(raw.createdAt || '').trim();
+  const updatedAt = String(raw.updatedAt || new Date().toISOString()).trim();
+  const customerName = String(raw.customerName || '').trim();
+  const projectName = String(raw.projectName || '').trim();
+  const companyId = String(raw.companyId || '').trim();
+  const projectId = String(raw.projectId || '').trim();
+  const createdBy = String(raw.createdBy || '').trim();
+  const evidenceText = String(raw.evidenceText || '');
+  const sequenceNo = Number.isFinite(Number(raw.sequenceNo)) ? Number(raw.sequenceNo) : undefined;
+  if (!id || id.length > policy.maxIdChars) return { ok: false, error: `第 ${idx + 1} 条任务 id 无效` };
+  if (!name || name.length > policy.maxNameChars) return { ok: false, error: `第 ${idx + 1} 条任务名称无效` };
+  if (!standardId || standardId.length > policy.maxIdChars) return { ok: false, error: `第 ${idx + 1} 条任务 standardId 无效` };
+  if (!ASSESSMENT_STATUS_SET.has(status)) return { ok: false, error: `第 ${idx + 1} 条任务 status 非法` };
+  if (!createdAt) return { ok: false, error: `第 ${idx + 1} 条任务缺少 createdAt` };
+  if (customerName.length > policy.maxProjectLabelChars || projectName.length > policy.maxProjectLabelChars) {
+    return { ok: false, error: `第 ${idx + 1} 条任务客户/项目名称超长` };
+  }
+  if (evidenceText.length > policy.maxEvidenceChars) {
+    return { ok: false, error: `第 ${idx + 1} 条任务证据文本超长（>${policy.maxEvidenceChars}）` };
+  }
+  const findingsRaw = Array.isArray(raw.findings) ? raw.findings : null;
+  if (!findingsRaw) return { ok: false, error: `第 ${idx + 1} 条任务 findings 必须为数组` };
+  const findings = [];
+  for (let fIdx = 0; fIdx < findingsRaw.length; fIdx += 1) {
+    const one = validateFindingShape(findingsRaw[fIdx], idx, fIdx, policy);
+    if (!one.ok) return { ok: false, error: one.error };
+    findings.push(one.value);
+  }
+  const evidenceMetrics = calcEvidenceMetrics(evidenceText);
+  const coverage = calculateCoverageRatio({ standardId, findings }, settings);
+  const evidencePerFindingChars = findings.length > 0 ? Math.round(evidenceMetrics.chars / findings.length) : evidenceMetrics.chars;
+  const qualityIssues = [];
+  if (evidenceMetrics.chars < policy.minEvidenceChars) qualityIssues.push('evidence_too_short');
+  if (evidenceMetrics.distinctChars < policy.minDistinctEvidenceChars) qualityIssues.push('evidence_low_distinct_chars');
+  if (evidenceMetrics.uniqueLineRatio < policy.minUniqueEvidenceRatio) qualityIssues.push('evidence_repetitive');
+  if (evidenceMetrics.placeholderHits > 0) qualityIssues.push('evidence_placeholder_like_text');
+  if (findings.length > 0 && evidencePerFindingChars < policy.minEvidencePerFindingChars) qualityIssues.push('evidence_per_finding_too_short');
+  if (findings.length > 0 && coverage.ratio < policy.minCoverageRatioForPublish) qualityIssues.push('coverage_below_threshold');
+  const qualityScore = Math.max(
+    0,
+    Math.min(
+      100,
+      Math.round(
+        40 * Math.min(1, evidenceMetrics.chars / Math.max(policy.minEvidenceChars, 1)) +
+          20 * Math.min(1, evidenceMetrics.distinctChars / Math.max(policy.minDistinctEvidenceChars, 1)) +
+          25 * coverage.ratio +
+          15 * Math.min(1, evidenceMetrics.uniqueLineRatio / Math.max(policy.minUniqueEvidenceRatio, 0.01))
+      )
+    )
+  );
+  const publishable = qualityIssues.length === 0;
+  const normalized = {
+    id,
+    name,
+    sequenceNo,
+    standardId,
+    customerName,
+    projectName,
+    companyId,
+    projectId,
+    createdBy,
+    status: publishable && status === 'Completed' ? 'Completed' : status === 'In Progress' ? 'In Progress' : 'Draft',
+    createdAt,
+    updatedAt,
+    findings,
+    evidenceText,
+  };
+  normalized.inputFingerprint = hashAssessmentInput(normalized);
+  normalized.quality = {
+    publishable,
+    score: qualityScore,
+    confidence: qualityScore >= 85 ? 'High' : qualityScore >= 65 ? 'Medium' : 'Low',
+    issues: qualityIssues,
+    metrics: {
+      evidenceChars: evidenceMetrics.chars,
+      evidenceDistinctChars: evidenceMetrics.distinctChars,
+      evidenceLineCount: evidenceMetrics.lines,
+      evidenceUniqueLineRatio: Number(evidenceMetrics.uniqueLineRatio.toFixed(3)),
+      evidencePlaceholderHits: evidenceMetrics.placeholderHits,
+      evidencePerFindingChars,
+      totalControls: coverage.totalControls,
+      assessedControls: coverage.assessedControls,
+      coverageRatio: Number(coverage.ratio.toFixed(3)),
+    },
+    policy: {
+      minCoverageRatioForPublish: policy.minCoverageRatioForPublish,
+      minEvidenceChars: policy.minEvidenceChars,
+      minDistinctEvidenceChars: policy.minDistinctEvidenceChars,
+      minUniqueEvidenceRatio: policy.minUniqueEvidenceRatio,
+      minEvidencePerFindingChars: policy.minEvidencePerFindingChars,
+    },
+  };
+  return { ok: true, value: normalized };
 }
 
 function readLegalRegulationsCache() {
@@ -1361,20 +1919,85 @@ app.get('/api/assessments', requireAuth, (req, res) => {
   res.json({ assessments: list });
 });
 
+app.post('/api/assessments/precheck', requireAuth, (req, res) => {
+  const settings = readSettings();
+  if (!hasPermission(req.user, settings, 'runAssessments')) {
+    return res.status(403).json({ error: '无权执行评估输入预检查' });
+  }
+  const policy = getAssessmentQualityPolicy(settings);
+  const raw = req.body && typeof req.body.assessment === 'object' ? req.body.assessment : null;
+  if (!raw) {
+    return res.status(400).json({ error: 'assessment 不能为空' });
+  }
+  const checked = validateAssessmentRecord(raw, 0, policy, settings);
+  if (!checked.ok) {
+    appendAudit({
+      action: 'assessments.precheck.reject',
+      actor: req.user.username,
+      detail: { reason: checked.error },
+    });
+    return res.status(400).json({ ok: false, error: checked.error });
+  }
+  const out = checked.value;
+  appendAudit({
+    action: 'assessments.precheck',
+    actor: req.user.username,
+    detail: {
+      assessmentId: out.id,
+      publishable: out.quality.publishable,
+      score: out.quality.score,
+      issueCount: out.quality.issues.length,
+      issues: out.quality.issues.slice(0, 8),
+    },
+  });
+  return res.json({
+    ok: true,
+    assessmentId: out.id,
+    publishable: out.quality.publishable,
+    score: out.quality.score,
+    confidence: out.quality.confidence,
+    issues: out.quality.issues,
+    metrics: out.quality.metrics,
+    inputFingerprint: out.inputFingerprint,
+  });
+});
+
 app.put('/api/assessments', requireAuth, (req, res) => {
   const settings = readSettings();
   if (!hasPermission(req.user, settings, 'runAssessments')) {
     return res.status(403).json({ error: '无权保存评估任务' });
   }
+  const policy = getAssessmentQualityPolicy(settings);
   const assessments = Array.isArray(req.body?.assessments) ? req.body.assessments : null;
   if (!assessments) {
     return res.status(400).json({ error: 'assessments 必须为数组' });
+  }
+  if (assessments.length > policy.maxAssessmentsPerRequest) {
+    return res.status(400).json({ error: `一次最多保存 ${policy.maxAssessmentsPerRequest} 条任务` });
+  }
+  const normalized = [];
+  const idSet = new Set();
+  for (let i = 0; i < assessments.length; i += 1) {
+    const checked = validateAssessmentRecord(assessments[i], i, policy, settings);
+    if (!checked.ok) {
+      appendAudit({
+        action: 'assessments.save.reject',
+        actor: req.user.username,
+        detail: { index: i, reason: checked.error },
+      });
+      return res.status(400).json({ error: checked.error, index: i });
+    }
+    if (idSet.has(checked.value.id)) {
+      return res.status(400).json({ error: `存在重复任务 id: ${checked.value.id}` });
+    }
+    idSet.add(checked.value.id);
+    normalized.push(checked.value);
   }
   const visibleCompanyIds = Array.isArray(req.user.visibleCompanyIds) ? req.user.visibleCompanyIds : [];
   const visibleProjectIds = Array.isArray(req.user.visibleProjectIds) ? req.user.visibleProjectIds : [];
   const hasCompanyScope = visibleCompanyIds.length > 0;
   const hasProjectScope = visibleProjectIds.length > 0;
-  const outOfScope = assessments.find((a) => {
+  const outOfScope = normalized.find((a) => {
     const companyId = String(a?.companyId || '');
     const projectId = String(a?.projectId || '');
     if (hasCompanyScope && companyId && !visibleCompanyIds.includes(companyId)) return true;
@@ -1385,14 +2008,59 @@ app.put('/api/assessments', requireAuth, (req, res) => {
     return res.status(403).json({ error: '包含超出当前用户可见范围（公司/项目）的任务数据' });
   }
   const store = readAssessmentsStore();
-  store.byUser[req.user.id] = assessments;
+  const previous = Array.isArray(store.byUser[req.user.id]) ? store.byUser[req.user.id] : [];
+  const prevById = new Map(previous.map((x) => [String(x && x.id ? x.id : ''), x]));
+  const issueDistribution = {};
+  const saved = normalized.map((item) => {
+    const prev = prevById.get(item.id);
+    const prevFingerprint = String(prev && prev.inputFingerprint ? prev.inputFingerprint : '');
+    if (prev && prevFingerprint && prevFingerprint === item.inputFingerprint && Array.isArray(prev.findings) && prev.findings.length > 0) {
+      return {
+        ...item,
+        findings: prev.findings,
+        quality: prev.quality || item.quality,
+        status: prev.status || item.status,
+      };
+    }
+    for (const reason of item.quality.issues) {
+      issueDistribution[reason] = (issueDistribution[reason] || 0) + 1;
+    }
+    return item;
+  });
+  const createdIds = saved
+    .map((x) => x.id)
+    .filter((id) => !prevById.has(id));
+  if (createdIds.length > 0) {
+    appendAudit({
+      action: 'assessments.create',
+      actor: req.user.username,
+      detail: {
+        count: createdIds.length,
+        assessmentIds: createdIds.slice(0, 20),
+      },
+    });
+  }
+  store.byUser[req.user.id] = saved;
   writeAssessmentsStore(store);
+  const publishableCount = saved.filter((x) => x?.quality?.publishable).length;
+  const draftByGate = saved.filter((x) => x?.status === 'Draft' && Array.isArray(x?.quality?.issues) && x.quality.issues.length > 0).length;
   appendAudit({
     action: 'assessments.save',
     actor: req.user.username,
-    detail: { count: assessments.length },
+    detail: {
+      count: saved.length,
+      publishableCount,
+      draftByGate,
+      issueDistribution,
+    },
   });
-  res.json({ ok: true, count: assessments.length });
+  res.json({
+    ok: true,
+    count: saved.length,
+    publishableCount,
+    draftByGate,
+    issueDistribution,
+  });
 });
 
 app.get('/api/users', requireAuth, (req, res) => {
@@ -1723,11 +2391,14 @@ app.put('/api/settings', requireAuth, (req, res) => {
     if (body.model != null && !hasPermission(req.user, settings, 'configureAiModel')) {
       return res.status(403).json({ error: '无权修改 AI 模型参数' });
     }
-    if (body.sync != null && !hasPermission(req.user, settings, 'syncStandardsApi')) {
+    if (body.sync != null && !hasPermission(req.user, settings, 'editStandards')) {
       return res.status(403).json({ error: '无权修改同步配置' });
     }
     if (body.permissions != null && !hasPermission(req.user, settings, 'manageUsers')) {
       return res.status(403).json({ error: '无权修改权限矩阵' });
+    }
+    if (body.standardsLibrary != null && !hasPermission(req.user, settings, 'editStandards')) {
+      return res.status(403).json({ error: '无权修改标准库' });
     }
 
     const next = {
@@ -1735,6 +2406,7 @@ app.put('/api/settings', requireAuth, (req, res) => {
       model: current.model,
       sync: current.sync,
       baseInfo: current.baseInfo,
+      standardsLibrary: current.standardsLibrary,
       permissions: current.permissions,
     };
     if (body.locale != null) {
@@ -1764,6 +2436,15 @@ app.put('/api/settings', requireAuth, (req, res) => {
       const teams = Array.isArray(raw.teams) ? raw.teams : [];
       next.baseInfo = { companies, projects, teams };
     }
+    if (body.standardsLibrary != null) {
+      const raw = body.standardsLibrary && typeof body.standardsLibrary === 'object' ? body.standardsLibrary : {};
+      const catalogEntries = Array.isArray(raw.catalogEntries) ? raw.catalogEntries : current.standardsLibrary?.catalogEntries || [];
+      const controls =
+        raw.controls && typeof raw.controls === 'object' && !Array.isArray(raw.controls)
+          ? raw.controls
+          : current.standardsLibrary?.controls || {};
+      next.standardsLibrary = { catalogEntries, controls };
+    }
 
     const saved = writeSettings(next);
     appendAudit({
@@ -1771,6 +2452,15 @@ app.put('/api/settings', requireAuth, (req, res) => {
       actor: req.user.username,
       detail: { keys: Object.keys(body) },
     });
+    if (body.standardsLibrary != null || body.sync != null) {
+      appendAudit({
+        action: 'standards.update',
+        actor: req.user.username,
+        detail: {
+          sourceKeys: Object.keys(body).filter((k) => k === 'standardsLibrary' || k === 'sync'),
+        },
+      });
+    }
     res.json(normalizeSettingsForClient(saved));
   } catch (e) {
     console.error(e);
@@ -1785,6 +2475,43 @@ app.get('/api/audit-log', requireAuth, (req, res) => {
   }
   const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
   res.json({ entries: readAuditTail(limit) });
+});
+
+app.post('/api/reports/download-event', requireAuth, (req, res) => {
+  const settings = readSettings();
+  if (!hasPermission(req.user, settings, 'exportReports')) {
+    return res.status(403).json({ error: '无权记录报告下载事件' });
+  }
+  const format = String(req.body?.format || '').trim().toLowerCase();
+  const assessmentId = String(req.body?.assessmentId || '').trim();
+  const standardId = String(req.body?.standardId || '').trim();
+  if (!['excel', 'word', 'pdf'].includes(format)) {
+    return res.status(400).json({ error: 'format 必须为 excel/word/pdf' });
+  }
+  appendAudit({
+    action: 'reports.download',
+    actor: req.user.username,
+    detail: {
+      format,
+      assessmentId,
+      standardId,
+    },
+  });
+  res.json({ ok: true });
+});
+
+app.get('/api/analytics/user-activity', requireAuth, (req, res) => {
+  const settings = readSettings();
+  if (!hasPermission(req.user, settings, 'viewAuditLog')) {
+    return res.status(403).json({ error: '无权查看用户活跃度分析' });
+  }
+  const days = Math.min(365, Math.max(1, Number(req.query.days) || 30));
+  const limit = Math.min(1000, Math.max(1, Number(req.query.limit) || 200));
+  const role = String(req.query.role || 'all');
+  const companyId = String(req.query.companyId || 'all');
+  const projectId = String(req.query.projectId || 'all');
+  const payload = buildUserActivityAnalytics({ days, role, companyId, projectId, limit });
+  res.json(payload);
 });
 
 /** 读取服务端缓存的法律法规 API 响应（供「法律法规自动更新架构」页展示） */
@@ -1951,7 +2678,7 @@ app.post('/api/legal-regulations/customer-summary', requireAuth, async (req, res
  */
 app.post('/api/legal-regulations/fetch', requireAuth, async (req, res) => {
   const settings = readSettings();
-  if (!hasPermission(req.user, settings, 'syncStandardsApi')) {
+  if (!hasPermission(req.user, settings, 'editStandards')) {
     return res.status(403).json({ error: '无权执行法律法规拉取' });
   }
   const currentSync = { ...DEFAULT_SETTINGS.sync, ...(settings.sync || {}) };
@@ -2490,7 +3217,7 @@ app.post('/api/legal-regulations/item/delete', requireAuth, (req, res) => {
 
 app.post('/api/standards/sync', requireAuth, async (req, res) => {
   const settings = readSettings();
-  if (!hasPermission(req.user, settings, 'syncStandardsApi')) {
+  if (!hasPermission(req.user, settings, 'editStandards')) {
     return res.status(403).json({ error: '无权执行标准同步' });
   }
 

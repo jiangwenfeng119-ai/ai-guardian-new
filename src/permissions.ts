@@ -169,7 +169,6 @@ export type PermissionKey =
   | 'manageUsers'
   | 'editStandards'
   | 'runAssessments'
-  | 'syncStandardsApi'
   | 'exportReports'
   | 'configureAiModel'
   | 'viewAuditLog'
@@ -186,7 +185,6 @@ export const PERMISSION_LABELS_I18N: Record<PermissionKey, { zh: string; en: str
   manageUsers: { zh: '用户与角色管理', en: 'Users & roles' },
   editStandards: { zh: '标准条款编辑', en: 'Edit standard clauses' },
   runAssessments: { zh: '发起与终止评估', en: 'Start & stop assessments' },
-  syncStandardsApi: { zh: '第三方标准 API 同步', en: 'Third-party standards API sync' },
   exportReports: { zh: '导出审计报告', en: 'Export audit reports' },
   configureAiModel: { zh: 'AI 模型参数配置', en: 'AI model configuration' },
   viewAuditLog: { zh: '查看审计日志', en: 'View audit logs' },
@@ -199,7 +197,6 @@ const PERMISSION_COLUMN_ORDER: PermissionKey[] = [
   'manageUsers',
   'editStandards',
   'runAssessments',
-  'syncStandardsApi',
   'exportReports',
   'configureAiModel',
   'viewAuditLog',
@@ -223,7 +220,6 @@ export const DEFAULT_PERMISSION_MATRIX: PermissionMatrix = {
     manageUsers: true,
     editStandards: true,
     runAssessments: true,
-    syncStandardsApi: true,
     exportReports: true,
     configureAiModel: true,
     viewAuditLog: true,
@@ -235,7 +231,6 @@ export const DEFAULT_PERMISSION_MATRIX: PermissionMatrix = {
     manageUsers: false,
     editStandards: true,
     runAssessments: true,
-    syncStandardsApi: true,
     exportReports: true,
     configureAiModel: true,
     viewAuditLog: true,
@@ -247,7 +242,6 @@ export const DEFAULT_PERMISSION_MATRIX: PermissionMatrix = {
     manageUsers: false,
     editStandards: false,
     runAssessments: true,
-    syncStandardsApi: false,
     exportReports: true,
     configureAiModel: false,
     viewAuditLog: true,
@@ -259,7 +253,6 @@ export const DEFAULT_PERMISSION_MATRIX: PermissionMatrix = {
     manageUsers: false,
     editStandards: false,
     runAssessments: true,
-    syncStandardsApi: false,
     exportReports: true,
     configureAiModel: false,
     viewAuditLog: false,
@@ -271,7 +264,6 @@ export const DEFAULT_PERMISSION_MATRIX: PermissionMatrix = {
     manageUsers: false,
     editStandards: false,
     runAssessments: false,
-    syncStandardsApi: false,
     exportReports: false,
     configureAiModel: false,
     viewAuditLog: false,

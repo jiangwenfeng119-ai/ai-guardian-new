@@ -42,6 +42,26 @@ export interface Assessment {
   findings: Finding[];
   /** 差距分析使用的证据全文快照；用于后台续跑、刷新后恢复 */
   evidenceText?: string;
+  /** 后端基于证据与覆盖率计算出的输入指纹，用于幂等复用 */
+  inputFingerprint?: string;
+  /** 输入质量门禁结果：用于区分草稿与可发布结果 */
+  quality?: {
+    publishable: boolean;
+    score: number;
+    confidence: 'High' | 'Medium' | 'Low';
+    issues: string[];
+    metrics?: {
+      evidenceChars?: number;
+      evidenceDistinctChars?: number;
+      evidenceLineCount?: number;
+      evidenceUniqueLineRatio?: number;
+      evidencePlaceholderHits?: number;
+      evidencePerFindingChars?: number;
+      totalControls?: number;
+      assessedControls?: number;
+      coverageRatio?: number;
+    };
+  };
 }
 
 export interface Finding {

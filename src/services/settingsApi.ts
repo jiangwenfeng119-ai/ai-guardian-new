@@ -53,6 +53,85 @@ export async function fetchAuditLog(limit = 30, opts?: { signal?: AbortSignal })
   return res.json() as Promise<{ entries: unknown[] }>;
 }
 
+export type UserActivityAnalyticsResponse = {
+  window: { days: number; since: string; until: string };
+  dimensions: { role: string; companyId: string; projectId: string };
+  metricDefinitions: Record<string, string>;
+  summary: {
+    totalUsers: number;
+    activeUsers: number;
+    activeUserRatio: number;
+    totalLoginOk: number;
+    totalAssessmentsCreated: number;
+    totalReportsDownloaded: number;
+    totalStandardsUpdated: number;
+    scoreDistribution: { high: number; medium: number; low: number };
+  };
+  trend: Array<{
+    day: string;
+    activeUsers: number;
+    loginCount: number;
+    assessmentCreatedCount: number;
+    reportDownloadedCount: number;
+    standardsUpdatedCount: number;
+  }>;
+  users: Array<{
+    userId: string;
+    username: string;
+    role: string;
+    companyId: string;
+    projectId: string;
+    activityScore: number;
+    activeLevel: 'high' | 'medium' | 'low';
+    activeDays: number;
+    lastActiveAt: string | null;
+    loginOkCount: number;
+    loginFailCount: number;
+    loginSuccessRate: number | null;
+    assessmentsCreatedCount: number;
+    assessmentsSavedCount: number;
+    reportsDownloadedCount: number;
+    standardsUpdatedCount: number;
+    settingsUpdatedCount: number;
+    avgSessionGapHours: number | null;
+  }>;
+};
+
+export async function fetchUserActivityAnalytics(params?: {
+  days?: number;
+  role?: string;
+  companyId?: string;
+  projectId?: string;
+  limit?: number;
+  signal?: AbortSignal;
+}) {
+  const q = new URLSearchParams();
+  if (params?.days != null) q.set('days', String(params.days));
+  if (params?.role) q.set('role', params.role);
+  if (params?.companyId) q.set('companyId', params.companyId);
+  if (params?.projectId) q.set('projectId', params.projectId);
+  if (params?.limit != null) q.set('limit', String(params.limit));
+  const qs = q.toString();
+  const res = await fetch(`/api/analytics/user-activity${qs ? `?${qs}` : ''}`, {
+    headers: { ...authHeaders() },
+    signal: params?.signal,
+  });
+  checkSession(res);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json() as Promise<UserActivityAnalyticsResponse>;
+}
+
+export async function postReportDownloadEvent(body: { format: 'excel' | 'word' | 'pdf'; assessmentId: string; standardId?: string }) {
+  const res = await fetch('/api/reports/download-event', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  checkSession(res);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json() as Promise<{ ok: boolean }>;
+}
+
 export async function postModelConnectionTest(
   model: Record<string, unknown>,
   ensureReady = false,
@@ -126,7 +205,42 @@ export async function putAssessments(assessments: Assessment[]) {
   });
   checkSession(res);
   if (!res.ok) throw new Error(await parseError(res));
-  return res.json() as Promise<{ ok: boolean; count: number }>;
+  return res.json() as Promise<{
+    ok: boolean;
+    count: number;
+    publishableCount?: number;
+    draftByGate?: number;
+    issueDistribution?: Record<string, number>;
+  }>;
+}
+
+export async function postAssessmentPrecheck(assessment: Assessment) {
+  const res = await fetch('/api/assessments/precheck', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ assessment }),
+  });
+  checkSession(res);
+  const data = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    error?: string;
+    publishable?: boolean;
+    score?: number;
+    confidence?: 'High' | 'Medium' | 'Low';
+    issues?: string[];
+    metrics?: Record<string, number>;
+    inputFingerprint?: string;
+  };
+  if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+  return data as {
+    ok: true;
+    publishable: boolean;
+    score: number;
+    confidence: 'High' | 'Medium' | 'Low';
+    issues: string[];
+    metrics?: Record<string, number>;
+    inputFingerprint?: string;
+  };
 }
 
 export async function postAiAssistantChat(body: { message: string; mode: 'default' | 'local' | 'cloud' }) {

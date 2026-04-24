@@ -39,7 +39,7 @@ import {
   putSettings,
   type LegalRegulationsCachePayload,
 } from '../services/settingsApi';
-import type { ApiSyncSettings } from '../permissions';
+import type { ApiSyncSettings, Role } from '../permissions';
 import { getLocale, type LocaleId } from '../i18n';
 import {
   displayLegalLastSyncAtLine,
@@ -85,6 +85,10 @@ interface StandardsConfigProps {
   /** 内置标准 + 自定义标准合并列表 */
   catalogEntries: StandardCatalogEntry[];
   onAddCustomStandard: (entry: StandardCatalogEntry) => void;
+  onUpdateCustomStandard?: (entry: StandardCatalogEntry) => void;
+  onDeleteCustomStandard?: (id: string) => void;
+  onReorderCatalogEntries?: (entries: StandardCatalogEntry[]) => void;
+  currentUserRole?: Role;
   /** 是否可配置第三方标准 API 同步（与系统设置一致） */
   canSyncStandardsApi?: boolean;
 }
@@ -102,6 +106,10 @@ export default function StandardsConfig({
   onUpdateControls,
   catalogEntries,
   onAddCustomStandard,
+  onUpdateCustomStandard,
+  onDeleteCustomStandard,
+  onReorderCatalogEntries,
+  currentUserRole,
   canSyncStandardsApi = false,
 }: StandardsConfigProps) {
   const [locale, setLocale] = useState<LocaleId>(() => getLocale());
@@ -113,6 +121,19 @@ export default function StandardsConfig({
       viewSync: '查看最新同步',
       addCustom: '新增自定义标准',
       importControls: '导入合规标准特定条款',
+      editStandard: '编辑标准',
+      deleteStandard: '删除标准',
+      builtinReadonly: '内置标准不可编辑或删除',
+      superAdminOnlyDelete: '仅超级管理员可删除',
+      editStandardTitle: '编辑合规标准',
+      standardNameRequired: '请填写标准名称',
+      save: '保存',
+      cancel: '取消',
+      stdName: '标准名称',
+      stdVersion: '版本 / 文号',
+      stdDesc: '说明',
+      deleteConfirm1: '确定删除该合规标准？',
+      deleteConfirm2: '请再次确认：删除后无法恢复，且会移除该标准下的检查项。',
     },
     'en-US': {
       lawTitle: 'AI-Powered Continuous Legal Regulations Library',
@@ -121,6 +142,19 @@ export default function StandardsConfig({
       viewSync: 'View Latest Sync',
       addCustom: 'Add Custom Standard',
       importControls: 'Import Standard Controls',
+      editStandard: 'Edit standard',
+      deleteStandard: 'Delete standard',
+      builtinReadonly: 'Built-in standards cannot be edited or deleted',
+      superAdminOnlyDelete: 'Only SuperAdmin can delete',
+      editStandardTitle: 'Edit compliance standard',
+      standardNameRequired: 'Please enter a standard name',
+      save: 'Save',
+      cancel: 'Cancel',
+      stdName: 'Standard name',
+      stdVersion: 'Version / Code',
+      stdDesc: 'Description',
+      deleteConfirm1: 'Delete this compliance standard?',
+      deleteConfirm2: 'Please confirm again: this cannot be undone and controls under this standard will be removed.',
     },
   } as const;
   const t = (k: keyof (typeof T)['zh-CN']) => T[locale][k] || T['zh-CN'][k];
@@ -135,6 +169,10 @@ export default function StandardsConfig({
     return () => window.removeEventListener('app-locale-change', onLocale as EventListener);
   }, []);
   const [selectedStandardId, setSelectedStandardId] = useState<string | null>(null);
+  const [cardMenuStandardId, setCardMenuStandardId] = useState<string | null>(null);
+  const [draggingStandardId, setDraggingStandardId] = useState<string | null>(null);
+  const [editStandardOpen, setEditStandardOpen] = useState(false);
+  const [editingStandard, setEditingStandard] = useState<StandardCatalogEntry | null>(null);
   const [editingControl, setEditingControl] = useState<Control | null>(null);
   const [isAdding, setIsAdding] = useState(false);
 
@@ -361,6 +399,7 @@ export default function StandardsConfig({
   };
 
   const activeStandard = catalogEntries.find((s) => s.id === selectedStandardId);
+  const isSuperAdmin = currentUserRole === 'SuperAdmin';
   const activeControls = selectedStandardId ? (controls[selectedStandardId] || []) : [];
 
   const handleSaveControl = (control: Control) => {
@@ -415,6 +454,55 @@ export default function StandardsConfig({
     setCustomDesc('');
     setSelectedStandardId(id);
   };
+
+  const openEditStandardDialog = (std: StandardCatalogEntry) => {
+    setCardMenuStandardId(null);
+    setEditingStandard({ ...std });
+    setEditStandardOpen(true);
+  };
+
+  const saveEditedStandard = () => {
+    if (!editingStandard) return;
+    const name = String(editingStandard.name || '').trim();
+    if (!name) {
+      window.alert(t('standardNameRequired'));
+      return;
+    }
+    onUpdateCustomStandard?.({
+      ...editingStandard,
+      name,
+      version: String(editingStandard.version || '').trim() || tx('自定义', 'Custom'),
+      description: String(editingStandard.description || '').trim() || tx('用户自定义标准', 'User-defined standard'),
+    });
+    setEditStandardOpen(false);
+    setEditingStandard(null);
+  };
+
+  const deleteStandardWithConfirm = (std: StandardCatalogEntry) => {
+    setCardMenuStandardId(null);
+    if (!isSuperAdmin) {
+      window.alert(t('superAdminOnlyDelete'));
+      return;
+    }
+    if (!window.confirm(t('deleteConfirm1'))) return;
+    if (!window.confirm(t('deleteConfirm2'))) return;
+    onDeleteCustomStandard?.(std.id);
+    if (selectedStandardId === std.id) setSelectedStandardId(null);
+  };
+
+  const reorderCatalogEntries = useCallback(
+    (fromId: string, toId: string) => {
+      if (!fromId || !toId || fromId === toId) return;
+      const fromIdx = catalogEntries.findIndex((s) => s.id === fromId);
+      const toIdx = catalogEntries.findIndex((s) => s.id === toId);
+      if (fromIdx < 0 || toIdx < 0) return;
+      const next = [...catalogEntries];
+      const [moved] = next.splice(fromIdx, 1);
+      next.splice(toIdx, 0, moved);
+      onReorderCatalogEntries?.(next);
+    },
+    [catalogEntries, onReorderCatalogEntries]
+  );
 
   const runImportFile = (file: File) => {
     setImportError(null);
@@ -1044,7 +1132,18 @@ export default function StandardsConfig({
         {catalogEntries.map(std => (
           <div 
             key={std.id}
-            className="glass-card p-8 flex flex-col group hover:-translate-y-2 transition-all duration-300"
+            draggable
+            onDragStart={() => {
+              setDraggingStandardId(std.id);
+              setCardMenuStandardId(null);
+            }}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={() => {
+              if (draggingStandardId) reorderCatalogEntries(draggingStandardId, std.id);
+              setDraggingStandardId(null);
+            }}
+            onDragEnd={() => setDraggingStandardId(null)}
+            className="glass-card p-8 flex flex-col group hover:-translate-y-2 transition-all duration-300 relative cursor-grab active:cursor-grabbing"
           >
             <div className="flex justify-between items-start mb-6">
               <div className={cn(
@@ -1055,10 +1154,39 @@ export default function StandardsConfig({
               )}>
                 <Shield size={28} />
               </div>
-              <button className="p-2 text-text-main/20 hover:text-text-main transition-colors rounded-xl hover:bg-white/50">
+              <button
+                type="button"
+                onClick={() => setCardMenuStandardId((cur) => (cur === std.id ? null : std.id))}
+                className="p-2 text-text-main/20 hover:text-text-main transition-colors rounded-xl hover:bg-white/50"
+              >
                 <MoreVertical size={20} />
               </button>
             </div>
+            {cardMenuStandardId === std.id ? (
+              <div className="absolute right-6 top-14 z-20 min-w-44 rounded-xl border border-white/70 bg-white/95 shadow-xl p-1.5">
+                <button
+                  type="button"
+                  onClick={() => openEditStandardDialog(std)}
+                  className="w-full text-left px-3 py-2 text-xs font-bold rounded-lg hover:bg-black/5"
+                >
+                  {tx('编辑', 'Edit')} · {tx('名称 / 版本 / 说明', 'Name / Version / Description')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => deleteStandardWithConfirm(std)}
+                  disabled={!isSuperAdmin}
+                  className={cn(
+                    'w-full text-left px-3 py-2 text-xs font-bold rounded-lg',
+                    !isSuperAdmin
+                      ? 'text-text-main/35 cursor-not-allowed'
+                      : 'text-danger-main hover:bg-danger-main/10'
+                  )}
+                >
+                  {tx('删除', 'Delete')}
+                  {!isSuperAdmin ? ` · ${t('superAdminOnlyDelete')}` : ''}
+                </button>
+              </div>
+            ) : null}
             
             <h3 className="font-black text-xl mb-1 group-hover:text-accent transition-colors">{std.name}</h3>
             <p className="text-[10px] font-black text-text-main/40 uppercase tracking-widest mb-6">{std.version}</p>
@@ -1155,6 +1283,85 @@ export default function StandardsConfig({
           if (f) runImportFile(f);
         }}
       />
+
+      <AnimatePresence>
+        {editStandardOpen && editingStandard && (
+          <div className="fixed inset-0 z-[82] flex items-center justify-center p-6">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-black/30 backdrop-blur-sm"
+              onClick={() => {
+                setEditStandardOpen(false);
+                setEditingStandard(null);
+              }}
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.96 }}
+              className="glass-card relative z-10 w-full max-w-lg p-8 border-white/80 shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between mb-6">
+                <h3 className="text-xl font-black">{t('editStandardTitle')}</h3>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditStandardOpen(false);
+                    setEditingStandard(null);
+                  }}
+                  className="p-2 rounded-lg hover:bg-black/5"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+              <div className="space-y-4">
+                <div>
+                  <label className="text-[10px] font-black text-text-main/40 uppercase tracking-widest ml-1">{t('stdName')}</label>
+                  <input
+                    value={editingStandard.name}
+                    onChange={(e) => setEditingStandard((prev) => (prev ? { ...prev, name: e.target.value } : prev))}
+                    className="glass-input w-full px-4 py-3 text-sm font-semibold mt-2"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] font-black text-text-main/40 uppercase tracking-widest ml-1">{t('stdVersion')}</label>
+                  <input
+                    value={editingStandard.version}
+                    onChange={(e) => setEditingStandard((prev) => (prev ? { ...prev, version: e.target.value } : prev))}
+                    className="glass-input w-full px-4 py-3 text-sm font-semibold mt-2"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] font-black text-text-main/40 uppercase tracking-widest ml-1">{t('stdDesc')}</label>
+                  <textarea
+                    value={editingStandard.description}
+                    onChange={(e) => setEditingStandard((prev) => (prev ? { ...prev, description: e.target.value } : prev))}
+                    className="glass-card bg-white/50 w-full p-4 text-sm rounded-2xl min-h-[90px] mt-2 outline-none"
+                  />
+                </div>
+              </div>
+              <div className="flex gap-3 mt-8">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditStandardOpen(false);
+                    setEditingStandard(null);
+                  }}
+                  className="flex-1 py-3 glass-card font-black text-xs uppercase tracking-widest"
+                >
+                  {t('cancel')}
+                </button>
+                <button type="button" onClick={saveEditedStandard} className="flex-1 py-3 glass-button">
+                  {t('save')}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
 
       <AnimatePresence>
         {addCustomOpen && (

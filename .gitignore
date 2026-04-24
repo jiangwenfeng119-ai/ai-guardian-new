@@ -9,3 +9,4 @@ coverage/
 .env*
 !.env.example
 data/
+node_modules

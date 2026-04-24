@@ -33,7 +33,6 @@ import {
   STANDARDS_CATALOG,
   catalogEntryToAppStandard,
   loadCustomStandardsFromStorage,
-  saveCustomStandardsToStorage,
   type StandardCatalogEntry,
 } from './constants/standardsCatalog';
 import { fetchAuthStatus, fetchMe, logout as authLogout } from './services/authApi';
@@ -46,12 +45,13 @@ const AiAssistant = lazy(() => import('./components/AiAssistant'));
 const StandardsConfig = lazy(() => import('./components/StandardsConfig'));
 const SystemSettings = lazy(() => import('./components/SystemSettings'));
 const AssessmentFlow = lazy(() => import('./components/AssessmentFlow'));
+const STORAGE_KEY_CATALOG_ENTRIES = 'ai_guardian_catalog_entries_v2';
 
-function TabLoading() {
+function TabLoading({ label }: { label: string }) {
   return (
     <div className="flex min-h-[40vh] items-center justify-center gap-3 text-text-main/50">
       <Loader2 className="animate-spin" size={28} />
-      <span className="text-sm font-semibold">加载中…</span>
+      <span className="text-sm font-semibold">{label}</span>
     </div>
   );
 }
@@ -73,12 +73,13 @@ function completedTaskFindingStats(findings: Assessment['findings']) {
 }
 
 const ALL_NAV = [
-  { id: 'dashboard' as const, label: 'D', tooltip: '仪表盘', icon: LayoutDashboard },
-  { id: 'assistant' as const, label: 'AI', tooltip: 'AI助手', icon: Bot },
-  { id: 'assessments' as const, label: 'A', tooltip: '评估任务', icon: FileText },
-  { id: 'standards' as const, label: 'S', tooltip: '合规标准', icon: Shield },
-  { id: 'settings' as const, label: 'C', tooltip: '配置', icon: Settings },
-];
+  { id: 'dashboard' as const, label: 'D', icon: LayoutDashboard },
+  { id: 'assistant' as const, label: 'AI', icon: Bot },
+  { id: 'assessments' as const, label: 'A', icon: FileText },
+  { id: 'standards' as const, label: 'S', icon: Shield },
+  { id: 'settings' as const, label: 'C', icon: Settings },
+] as const;
+
 const I18N: Record<LocaleId, Record<string, string>> = {
   'zh-CN': {
     dashboard: '仪表盘',
@@ -89,6 +90,30 @@ const I18N: Record<LocaleId, Record<string, string>> = {
     logout: '退出',
     init: '正在初始化…',
     loadPerm: '正在加载权限…',
+    tabLoading: '加载中…',
+    apiDownTitle: '无法连接后端 API',
+    loginApiWarning: '后端可能不可用，登录可能失败',
+    flowTitle: '安全合规评估流水线',
+    backgroundRunHint: '当前有评估任务在后台运行，切换到「评估任务」可查看进度',
+    assessmentsSubtitle: '利用核心 AI 引擎驱动的实时差距分析平台',
+    newAnalysisEngine: '新建分析引擎',
+    filterAllCompanies: '全部公司',
+    filterAllProjects: '全部项目',
+    filterAllCreators: '全部创建人',
+    emptyNoAssessments: '暂无评估任务，点击上方按钮新建',
+    emptyNoMatches: '当前筛选条件下暂无任务',
+    deleteTaskTitle: '删除任务',
+    deleteTaskConfirm:
+      '确定删除该评估任务？本任务下的分析结果与本地记录将被移除（浏览器下载的导出文件需自行删除）。',
+    labelCompany: '公司',
+    labelProject: '项目',
+    statComplianceRate: '合规率',
+    statCompliant: '符合',
+    statPartial: '部分符合',
+    statNonCompliant: '不符合',
+    statusCompleted: '已完成',
+    statusInProgress: '分析中',
+    statusDraft: '草稿',
   },
   'en-US': {
     dashboard: 'Dashboard',
@@ -99,6 +124,31 @@ const I18N: Record<LocaleId, Record<string, string>> = {
     logout: 'Logout',
     init: 'Initializing…',
     loadPerm: 'Loading permissions…',
+    tabLoading: 'Loading…',
+    apiDownTitle: 'Cannot connect to the backend API',
+    loginApiWarning: 'The backend may be unavailable; sign-in could fail.',
+    flowTitle: 'Security compliance assessment pipeline',
+    backgroundRunHint:
+      'An assessment is running in the background. Open Assessments to view progress.',
+    assessmentsSubtitle: 'Real-time gap analysis powered by the core AI engine',
+    newAnalysisEngine: 'New analysis',
+    filterAllCompanies: 'All companies',
+    filterAllProjects: 'All projects',
+    filterAllCreators: 'All creators',
+    emptyNoAssessments: 'No assessments yet. Use the button above to create one.',
+    emptyNoMatches: 'No tasks match the current filters.',
+    deleteTaskTitle: 'Delete task',
+    deleteTaskConfirm:
+      'Delete this assessment? Analysis results and server records for this task will be removed (exported files you downloaded stay on disk).',
+    labelCompany: 'Company',
+    labelProject: 'Project',
+    statComplianceRate: 'Compliance',
+    statCompliant: 'Compliant',
+    statPartial: 'Partial',
+    statNonCompliant: 'Non-compliant',
+    statusCompleted: 'Completed',
+    statusInProgress: 'In progress',
+    statusDraft: 'Draft',
   },
 };
 
@@ -169,6 +219,7 @@ export default function App() {
   });
 
   const [assessmentsHydrated, setAssessmentsHydrated] = useState(false);
+  const standardsHydratedRef = useRef(false);
   /** JSON snapshot last successfully persisted (or loaded from server) to skip redundant PUTs. */
   const lastSavedAssessmentsSig = useRef<string | null>(null);
 
@@ -176,11 +227,28 @@ export default function App() {
     localStorage.setItem(STORAGE_KEY_CONTROLS, JSON.stringify(controls));
   }, [controls]);
 
-  const [customStandards, setCustomStandards] = useState<StandardCatalogEntry[]>(() => loadCustomStandardsFromStorage());
+  const [catalogEntries, setCatalogEntries] = useState<StandardCatalogEntry[]>(() => {
+    try {
+      if (typeof window === 'undefined') return [...STANDARDS_CATALOG];
+      const raw = localStorage.getItem(STORAGE_KEY_CATALOG_ENTRIES);
+      if (raw) {
+        const parsed = JSON.parse(raw) as unknown;
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed as StandardCatalogEntry[];
+      }
+      const legacyCustom = loadCustomStandardsFromStorage();
+      return [...STANDARDS_CATALOG, ...legacyCustom];
+    } catch {
+      return [...STANDARDS_CATALOG];
+    }
+  });
 
   useEffect(() => {
-    saveCustomStandardsToStorage(customStandards);
-  }, [customStandards]);
+    try {
+      localStorage.setItem(STORAGE_KEY_CATALOG_ENTRIES, JSON.stringify(catalogEntries));
+    } catch {
+      // ignore quota
+    }
+  }, [catalogEntries]);
 
   useEffect(() => {
     let cancelled = false;
@@ -270,6 +338,7 @@ export default function App() {
   }, []);
 
   const t = useCallback((key: keyof (typeof I18N)['zh-CN']) => I18N[locale][key] || key, [locale]);
+  const tx = useCallback((zh: string, en: string) => (locale === 'en-US' ? en : zh), [locale]);
 
   const effectivePermissions = useMemo(() => {
     if (!user) return null;
@@ -277,6 +346,65 @@ export default function App() {
     return getRolePermissions(matrix, user.role as Role);
   }, [user, settingsForPerm]);
   const canAssess = !!effectivePermissions?.runAssessments;
+  const canEditStandards = !!effectivePermissions?.editStandards;
+  const evalRuntimeConfig = useMemo(() => {
+    const m =
+      settingsForPerm && typeof settingsForPerm.model === 'object'
+        ? (settingsForPerm.model as { evalConcurrency?: unknown; timeoutSec?: unknown })
+        : {};
+    const c = Number(m.evalConcurrency);
+    const sec = Number(m.timeoutSec);
+    const concurrency = [2, 3, 5].includes(c) ? c : 3;
+    const timeoutMs = Number.isFinite(sec) ? Math.min(300000, Math.max(15000, sec * 1000)) : 90000;
+    return { concurrency, timeoutMs };
+  }, [settingsForPerm]);
+
+  useEffect(() => {
+    if (!user?.id) {
+      standardsHydratedRef.current = false;
+      return;
+    }
+    if (standardsHydratedRef.current) return;
+    const lib =
+      settingsForPerm &&
+      typeof settingsForPerm === 'object' &&
+      settingsForPerm.standardsLibrary &&
+      typeof settingsForPerm.standardsLibrary === 'object'
+        ? (settingsForPerm.standardsLibrary as Record<string, unknown>)
+        : null;
+    if (!lib) return;
+
+    const serverCatalogEntries = Array.isArray(lib.catalogEntries)
+      ? (lib.catalogEntries as StandardCatalogEntry[])
+      : null;
+    const serverControls =
+      lib.controls && typeof lib.controls === 'object' && !Array.isArray(lib.controls)
+        ? (lib.controls as Record<string, Control[]>)
+        : null;
+
+    if (serverCatalogEntries && serverCatalogEntries.length > 0) {
+      setCatalogEntries(serverCatalogEntries);
+    }
+    if (serverControls) {
+      setControls(serverControls);
+    }
+    standardsHydratedRef.current = true;
+  }, [user?.id, settingsForPerm]);
+
+  useEffect(() => {
+    if (!user?.id || !canEditStandards || !standardsHydratedRef.current) return;
+    const timer = setTimeout(() => {
+      void putSettings({
+        standardsLibrary: {
+          catalogEntries,
+          controls,
+        },
+      }).catch((e) => {
+        console.error('Failed to save standards library to server:', e);
+      });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [user?.id, canEditStandards, catalogEntries, controls]);
 
   useEffect(() => {
     if (!user?.id || !canAssess) return;
@@ -332,7 +460,7 @@ export default function App() {
         return (
           effectivePermissions.manageUsers ||
           effectivePermissions.configureAiModel ||
-          effectivePermissions.syncStandardsApi ||
+          effectivePermissions.editStandards ||
           effectivePermissions.viewAuditLog ||
           effectivePermissions.viewAppAbout
         );
@@ -367,7 +495,6 @@ export default function App() {
   }, []);
 
   const runDeepEvaluation = useCallback(async () => {
-    const tx = (zh: string, en: string) => (locale === 'en-US' ? en : zh);
     if (!canAssess || deepEvaluating) return;
     const candidates = assessments
       .filter((a) => a.status === 'Completed' && (a.evidenceText || '').trim())
@@ -417,32 +544,8 @@ export default function App() {
     const affectedAssessmentIds = new Set<string>();
     const itemRuns: DeepEvalTaskRecord['itemRuns'] = [];
     try {
-      const rawConcurrency = Number(
-        (() => {
-          try {
-            const raw = localStorage.getItem('ai_guardian_settings_model_v1');
-            if (!raw) return 3;
-            const parsed = JSON.parse(raw) as { evalConcurrency?: number };
-            return parsed.evalConcurrency;
-          } catch {
-            return 3;
-          }
-        })()
-      );
-      const BATCH_SIZE = [2, 3, 5].includes(rawConcurrency) ? rawConcurrency : 3;
-      const perItemTimeoutMs = Number(
-        (() => {
-          try {
-            const raw = localStorage.getItem('ai_guardian_settings_model_v1');
-            if (!raw) return 90000;
-            const parsed = JSON.parse(raw) as { timeoutSec?: number };
-            const sec = Number(parsed.timeoutSec || 90);
-            return Math.min(300000, Math.max(15000, sec * 1000));
-          } catch {
-            return 90000;
-          }
-        })()
-      );
+      const BATCH_SIZE = evalRuntimeConfig.concurrency;
+      const perItemTimeoutMs = evalRuntimeConfig.timeoutMs;
       for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
         const batch = candidates.slice(i, i + BATCH_SIZE);
         const results = await Promise.all(
@@ -456,7 +559,17 @@ export default function App() {
               const next = (await Promise.race([
                 performGapAnalysis(control, item.evidence, { preferCloud: true, deepEval: true }),
                 new Promise<never>((_, reject) =>
-                  setTimeout(() => reject(new Error(`单项深度评估超时（>${perItemTimeoutMs}ms）`)), perItemTimeoutMs)
+                  setTimeout(
+                    () =>
+                      reject(
+                        new Error(
+                          locale === 'en-US'
+                            ? `Deep evaluation item timed out (>${perItemTimeoutMs}ms)`
+                            : `单项深度评估超时（>${perItemTimeoutMs}ms）`
+                        )
+                      ),
+                    perItemTimeoutMs
+                  )
                 ),
               ])) as GapAnalysisResult;
               return { ok: true as const, item, next, durationMs: Date.now() - started };
@@ -590,7 +703,7 @@ export default function App() {
     } finally {
       setDeepEvaluating(false);
     }
-  }, [assessments, canAssess, controls, deepEvaluating, locale]);
+  }, [assessments, canAssess, controls, deepEvaluating, locale, tx, evalRuntimeConfig]);
 
   const updateFindingAttentionState = useCallback(
     (assessmentId: string, controlId: string, nextState: 'pending' | 'processing' | 'resolved') => {
@@ -617,10 +730,7 @@ export default function App() {
       .catch(() => {});
   }, []);
 
-  const mergedAppStandards = useMemo(
-    () => [...STANDARDS_CATALOG.map(catalogEntryToAppStandard), ...customStandards.map(catalogEntryToAppStandard)],
-    [customStandards]
-  );
+  const mergedAppStandards = useMemo(() => catalogEntries.map(catalogEntryToAppStandard), [catalogEntries]);
 
   const standardNameById = useMemo(() => {
     const m: Record<string, string> = {};
@@ -630,7 +740,7 @@ export default function App() {
     return m;
   }, [mergedAppStandards]);
 
-  const catalogEntriesMerged = useMemo(() => [...STANDARDS_CATALOG, ...customStandards], [customStandards]);
+  const catalogEntriesMerged = catalogEntries;
   const baseInfo = useMemo(() => {
     const raw = settingsForPerm && typeof settingsForPerm.baseInfo === 'object' ? (settingsForPerm.baseInfo as Record<string, unknown>) : {};
     return {
@@ -696,8 +806,25 @@ export default function App() {
   }, [assessments]);
 
   const handleAddCustomStandard = useCallback((entry: StandardCatalogEntry) => {
-    setCustomStandards((prev) => [...prev, entry]);
+    setCatalogEntries((prev) => [...prev, entry]);
     setControls((prev) => ({ ...prev, [entry.id]: [] }));
+  }, []);
+
+  const handleUpdateStandard = useCallback((entry: StandardCatalogEntry) => {
+    setCatalogEntries((prev) => prev.map((s) => (s.id === entry.id ? { ...s, ...entry } : s)));
+  }, []);
+
+  const handleDeleteStandard = useCallback((id: string) => {
+    setCatalogEntries((prev) => prev.filter((s) => s.id !== id));
+    setControls((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }, []);
+
+  const handleReorderStandards = useCallback((entries: StandardCatalogEntry[]) => {
+    setCatalogEntries(entries);
   }, []);
 
   if (authLoading) {
@@ -717,10 +844,22 @@ export default function App() {
       <div className="min-h-screen flex flex-col items-center justify-center p-8 text-center gap-4 max-w-lg mx-auto">
         <AppLogo className="h-12 w-auto max-w-[min(90vw,260px)] mx-auto" />
         <AlertCircle className="text-danger-main" size={48} />
-        <h1 className="text-xl font-black">无法连接后端 API</h1>
+        <h1 className="text-xl font-black">{t('apiDownTitle')}</h1>
         <p className="text-text-main/60 text-sm leading-relaxed">
-          请在本机用 <strong>PowerShell</strong> 进入项目目录后执行 <code className="font-mono text-xs bg-black/5 px-1 rounded">.\run-dev.ps1</code>
-          （无需 npm）。浏览器请打开 <strong>终端里显示的 Local 地址</strong>（可能是 3001、3002…），不要用「直接打开磁盘上的 html」。
+          {locale === 'en-US' ? (
+            <>
+              In the project folder, run{' '}
+              <code className="font-mono text-xs bg-black/5 px-1 rounded">.\run-dev.ps1</code> in <strong>PowerShell</strong>{' '}
+              (npm is not required). Open the <strong>Local URL</strong> printed in the terminal (it may be 3001, 3002, …). Do
+              not open the HTML file directly from disk.
+            </>
+          ) : (
+            <>
+              请在本机用 <strong>PowerShell</strong> 进入项目目录后执行{' '}
+              <code className="font-mono text-xs bg-black/5 px-1 rounded">.\run-dev.ps1</code>
+              （无需 npm）。浏览器请打开 <strong>终端里显示的 Local 地址</strong>（可能是 3001、3002…），不要用「直接打开磁盘上的 html」。
+            </>
+          )}
         </p>
         {apiErrorDetail && (
           <div className="glass-card p-4 text-left text-xs text-danger-main/90 font-mono whitespace-pre-wrap break-words w-full">
@@ -728,7 +867,16 @@ export default function App() {
           </div>
         )}
         <p className="text-text-main/45 text-xs">
-          若 8787 被占用：结束旧终端里的 node，或执行 <code className="font-mono">.\run-dev-api-only.ps1</code> 前先释放端口。
+          {locale === 'en-US' ? (
+            <>
+              If port 8787 is in use: stop the old Node process, or free the port before running{' '}
+              <code className="font-mono">.\run-dev-api-only.ps1</code>.
+            </>
+          ) : (
+            <>
+              若 8787 被占用：结束旧终端里的 node，或执行 <code className="font-mono">.\run-dev-api-only.ps1</code> 前先释放端口。
+            </>
+          )}
         </p>
       </div>
     );
@@ -739,7 +887,7 @@ export default function App() {
       <div className="relative">
         {apiDown && (
           <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 glass-card px-6 py-3 text-sm text-warning-main font-semibold">
-            后端可能不可用，登录可能失败
+            {t('loginApiWarning')}
           </div>
         )}
         <LoginPage needsBootstrap={needsBootstrap} onLoggedIn={handleLoggedIn} />
@@ -771,8 +919,28 @@ export default function App() {
             <button
               key={item.id}
               type="button"
-              title={item.tooltip}
-              aria-label={item.tooltip}
+              title={
+                item.id === 'dashboard'
+                  ? t('dashboard')
+                  : item.id === 'assistant'
+                    ? t('assistant')
+                    : item.id === 'assessments'
+                      ? t('assessments')
+                      : item.id === 'standards'
+                        ? t('standards')
+                        : t('settings')
+              }
+              aria-label={
+                item.id === 'dashboard'
+                  ? t('dashboard')
+                  : item.id === 'assistant'
+                    ? t('assistant')
+                    : item.id === 'assessments'
+                      ? t('assessments')
+                      : item.id === 'standards'
+                        ? t('standards')
+                        : t('settings')
+              }
               onClick={() => setActiveTab(item.id)}
               className={cn(
                 'w-12 h-12 flex items-center justify-center rounded-xl text-sm font-bold transition-all duration-300 relative group',
@@ -815,7 +983,7 @@ export default function App() {
                 )}
                 <h1 className="text-2xl font-bold tracking-tight">
                   {selectedAssessmentId
-                    ? '安全合规评估流水线'
+                    ? t('flowTitle')
                     : (activeTab === 'dashboard'
                         ? t('dashboard')
                         : activeTab === 'assistant'
@@ -828,7 +996,7 @@ export default function App() {
                 </h1>
               </div>
               {selectedAssessmentId && activeTab !== 'assessments' && canAssess && (
-                <span className="text-xs font-semibold text-accent/90 mt-1">当前有评估任务在后台运行，切换到「评估任务」可查看进度</span>
+                <span className="text-xs font-semibold text-accent/90 mt-1">{t('backgroundRunHint')}</span>
               )}
               {!selectedAssessmentId && (
                 <span className="text-xs font-semibold opacity-60 uppercase tracking-widest mt-1">AI Security Compliance Auditor</span>
@@ -889,7 +1057,7 @@ export default function App() {
                 <Dashboard
                   assessments={assessments}
                   deepEvalTasks={deepEvalTasks}
-                  customStandardsCatalog={customStandards}
+                  customStandardsCatalog={catalogEntriesMerged}
                   onUpdateAttentionState={updateFindingAttentionState}
                   onSelectAssessment={
                     canAssess
@@ -908,7 +1076,7 @@ export default function App() {
 
             {activeTab === 'assistant' && (
               <motion.div key="assistant" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }}>
-                <Suspense fallback={<TabLoading />}>
+                <Suspense fallback={<TabLoading label={t('tabLoading')} />}>
                   <AiAssistant sessionKey={user.id} />
                 </Suspense>
               </motion.div>
@@ -923,8 +1091,8 @@ export default function App() {
               >
                 <div className="flex justify-between items-end mb-10">
                   <div>
-                    <h2 className="text-3xl font-black mb-2">评估任务</h2>
-                    <p className="text-text-main/60 font-medium text-base">利用核心 AI 引擎驱动的实时差距分析平台</p>
+                    <h2 className="text-3xl font-black mb-2">{t('assessments')}</h2>
+                    <p className="text-text-main/60 font-medium text-base">{t('assessmentsSubtitle')}</p>
                   </div>
                   <button
                     type="button"
@@ -933,7 +1101,7 @@ export default function App() {
                     className={cn('glass-button flex items-center gap-2 px-5 py-2.5 text-sm', !canAssess && 'opacity-40 cursor-not-allowed')}
                   >
                     <Plus size={18} />
-                    新建分析引擎
+                    {t('newAnalysisEngine')}
                   </button>
                 </div>
                 <div className="mb-6 flex flex-wrap items-center gap-3">
@@ -946,7 +1114,7 @@ export default function App() {
                       setAssessmentProjectFilter('all');
                     }}
                   >
-                    <option value="all">全部公司</option>
+                    <option value="all">{t('filterAllCompanies')}</option>
                     {visibleCompaniesForFilter.map((c) => (
                       <option key={c.id} value={c.id}>
                         {c.name || c.id}
@@ -958,7 +1126,7 @@ export default function App() {
                     value={assessmentProjectFilter}
                     onChange={(e) => setAssessmentProjectFilter(e.target.value)}
                   >
-                    <option value="all">全部项目</option>
+                    <option value="all">{t('filterAllProjects')}</option>
                     {visibleProjectsForFilter.map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name || p.id}
@@ -970,7 +1138,7 @@ export default function App() {
                     value={assessmentCreatorFilter}
                     onChange={(e) => setAssessmentCreatorFilter(e.target.value)}
                   >
-                    <option value="all">全部创建人</option>
+                    <option value="all">{t('filterAllCreators')}</option>
                     {creatorOptions.map((u) => (
                       <option key={u} value={u}>
                         {u}
@@ -981,6 +1149,7 @@ export default function App() {
 
                 <NewAssessmentModal
                   open={newAssessmentOpen}
+                  locale={locale}
                   onClose={() => setNewAssessmentOpen(false)}
                   standards={mergedAppStandards}
                   companies={baseInfo.companies}
@@ -1031,7 +1200,9 @@ export default function App() {
                   {filteredAssessments.length === 0 ? (
                     <div className="col-span-full py-20 glass-card border-dashed flex flex-col items-center justify-center text-text-main/40">
                       <FileText size={48} strokeWidth={1} className="mb-4 opacity-30" />
-                      <p className="font-bold tracking-tight text-lg">{assessments.length === 0 ? '暂无评估任务，点击上方按钮新建' : '当前筛选条件下暂无任务'}</p>
+                      <p className="font-bold tracking-tight text-lg">
+                        {assessments.length === 0 ? t('emptyNoAssessments') : t('emptyNoMatches')}
+                      </p>
                     </div>
                   ) : (
                     filteredAssessments.map((item) => {
@@ -1051,15 +1222,11 @@ export default function App() {
                         {canAssess && (
                           <button
                             type="button"
-                            title="删除任务"
+                            title={t('deleteTaskTitle')}
                             className="absolute top-4 right-4 z-10 p-2 rounded-lg text-text-main/35 hover:text-danger-main hover:bg-danger-main/10 transition-colors"
                             onClick={(e) => {
                               e.stopPropagation();
-                              if (
-                                !window.confirm(
-                                  '确定删除该评估任务？本任务下的分析结果与本地记录将被移除（浏览器下载的导出文件需自行删除）。'
-                                )
-                              ) {
+                              if (!window.confirm(t('deleteTaskConfirm'))) {
                                 return;
                               }
                               setAssessments((prev) => {
@@ -1094,7 +1261,11 @@ export default function App() {
                                   : 'bg-warning-main/20 text-warning-main'
                             )}
                           >
-                            {item.status === 'Completed' ? 'Completed' : item.status === 'In Progress' ? 'Analyzing' : 'Ready'}
+                            {item.status === 'Completed'
+                              ? t('statusCompleted')
+                              : item.status === 'In Progress'
+                                ? t('statusInProgress')
+                                : t('statusDraft')}
                           </div>
                           <ChevronRight className="text-text-main/20 group-hover:text-accent transition-colors shrink-0" size={20} />
                         </div>
@@ -1104,30 +1275,34 @@ export default function App() {
                         </p>
                         <div className="mb-4 flex flex-wrap gap-2">
                           <span className="rounded-full border border-black/10 bg-white/70 px-2.5 py-1 text-[10px] font-bold text-text-main/70">
-                            公司：{companyLabel}
+                            {t('labelCompany')}
+                            {locale === 'en-US' ? ': ' : '：'}
+                            {companyLabel}
                           </span>
                           <span className="rounded-full border border-black/10 bg-white/70 px-2.5 py-1 text-[10px] font-bold text-text-main/70">
-                            项目：{projectLabel}
+                            {t('labelProject')}
+                            {locale === 'en-US' ? ': ' : '：'}
+                            {projectLabel}
                           </span>
                         </div>
                         {item.status === 'Completed' && cardStats && (
                           <div className="grid grid-cols-2 gap-1.5 mb-3.5">
                             <div className="rounded-lg bg-accent/10 border border-accent/20 px-2 py-1.5 text-center">
-                              <p className="text-[8px] font-black uppercase tracking-wider text-text-main/45 mb-px">合规率</p>
+                              <p className="text-[8px] font-black uppercase tracking-wider text-text-main/45 mb-px">{t('statComplianceRate')}</p>
                               <p className="text-base font-black text-accent tabular-nums leading-tight">
                                 {cardStats.ratePct !== null ? `${cardStats.ratePct}%` : '—'}
                               </p>
                             </div>
                             <div className="rounded-lg bg-success-main/10 border border-success-main/20 px-2 py-1.5 text-center">
-                              <p className="text-[8px] font-black uppercase tracking-wider text-text-main/45 mb-px">符合</p>
+                              <p className="text-[8px] font-black uppercase tracking-wider text-text-main/45 mb-px">{t('statCompliant')}</p>
                               <p className="text-base font-black text-success-main tabular-nums leading-tight">{cardStats.compliant}</p>
                             </div>
                             <div className="rounded-lg bg-warning-main/10 border border-warning-main/20 px-2 py-1.5 text-center">
-                              <p className="text-[8px] font-black uppercase tracking-wider text-text-main/45 mb-px">部分符合</p>
+                              <p className="text-[8px] font-black uppercase tracking-wider text-text-main/45 mb-px">{t('statPartial')}</p>
                               <p className="text-base font-black text-warning-main tabular-nums leading-tight">{cardStats.partial}</p>
                             </div>
                             <div className="rounded-lg bg-danger-main/10 border border-danger-main/20 px-2 py-1.5 text-center">
-                              <p className="text-[8px] font-black uppercase tracking-wider text-text-main/45 mb-px">不符合</p>
+                              <p className="text-[8px] font-black uppercase tracking-wider text-text-main/45 mb-px">{t('statNonCompliant')}</p>
                               <p className="text-base font-black text-danger-main tabular-nums leading-tight">{cardStats.nonCompliant}</p>
                             </div>
                           </div>
@@ -1140,8 +1315,8 @@ export default function App() {
                           <div className="flex items-center gap-1 uppercase">
                             <CheckCircle2 size={14} />
                             {item.status === 'Completed' && cardStats
-                              ? `${cardStats.total} 条检查项`
-                              : `${item.findings.length} Gaps`}
+                              ? tx(`${cardStats.total} 条检查项`, `${cardStats.total} controls`)
+                              : tx(`${item.findings.length} 条发现项`, `${item.findings.length} findings`)}
                           </div>
                           <div className="flex items-center gap-1">
                             <User size={14} />
@@ -1158,13 +1333,17 @@ export default function App() {
 
             {activeTab === 'standards' && (
               <motion.div key="standards" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
-                <Suspense fallback={<TabLoading />}>
+                <Suspense fallback={<TabLoading label={t('tabLoading')} />}>
                   <StandardsConfig
                     controls={controls}
                     onUpdateControls={setControls}
                     catalogEntries={catalogEntriesMerged}
                     onAddCustomStandard={handleAddCustomStandard}
-                    canSyncStandardsApi={effectivePermissions.syncStandardsApi}
+                    onUpdateCustomStandard={handleUpdateStandard}
+                    onDeleteCustomStandard={handleDeleteStandard}
+                    onReorderCatalogEntries={handleReorderStandards}
+                    currentUserRole={user.role as Role}
+                    canSyncStandardsApi={effectivePermissions.editStandards}
                   />
                 </Suspense>
               </motion.div>
@@ -1172,7 +1351,7 @@ export default function App() {
 
             {activeTab === 'settings' && (
               <motion.div key="settings" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
-                <Suspense fallback={<TabLoading />}>
+                <Suspense fallback={<TabLoading label={t('tabLoading')} />}>
                   <SystemSettings
                     currentUserId={user.id}
                     role={user.role as Role}
@@ -1198,11 +1377,13 @@ export default function App() {
                 animate={{ opacity: 1, x: 0 }}
                 className="glass-card p-10"
               >
-                <Suspense fallback={<TabLoading />}>
+                <Suspense fallback={<TabLoading label={t('tabLoading')} />}>
                   <AssessmentFlow
                     assessment={assessments.find((a) => a.id === selectedAssessmentId)!}
                     standards={mergedAppStandards}
                     controls={controls}
+                    evalConcurrency={evalRuntimeConfig.concurrency}
+                    perItemTimeoutMs={evalRuntimeConfig.timeoutMs}
                     canViewAssessmentResults={effectivePermissions.viewAssessmentResults}
                     onUpdate={(assessmentId, next) => {
                       setAssessments((prev) =>

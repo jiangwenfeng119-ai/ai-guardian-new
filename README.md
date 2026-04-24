@@ -22,3 +22,8 @@ View your app in AI Studio: https://ai.studio/apps/9cb6e624-53b0-4d11-aae9-93fb9
 ## 中文项目说明（技术栈 / 架构 / 部署）
 
 见 **[docs/PROJECT_GUIDE.md](docs/PROJECT_GUIDE.md)**（含本地与多环境运行、Git 保存代码、环境变量与端口说明）。
+
+## Cursor 使用与 CI/CD
+
+- Cursor 工作模式与从 0 开始步骤：**[docs/CURSOR_WORKFLOW.md](docs/CURSOR_WORKFLOW.md)**
+- GitHub Actions 工作流：`.github/workflows/ci-cd.yml`

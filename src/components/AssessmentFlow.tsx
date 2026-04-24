@@ -18,6 +18,8 @@ import { motion } from 'motion/react';
 import { Assessment, Standard, Finding, Control } from '../types';
 import { performGapAnalysis, generateExecutiveSummary, type GapAnalysisResult } from '../services/gemini';
 import { EXPORT_SERVICE } from '../services/export';
+import { postReportDownloadEvent } from '../services/settingsApi';
+import { postAssessmentPrecheck } from '../services/settingsApi';
 import {
   abortAssessmentAnalysis,
   isAssessmentAnalysisRunning,
@@ -31,6 +33,10 @@ interface AssessmentFlowProps {
   assessment: Assessment;
   standards: Standard[];
   controls: Record<string, Control[]>;
+  /** 自动评估并发数（建议 2/3/5；由系统设置下发） */
+  evalConcurrency?: number;
+  /** 单项自动评估超时时间（毫秒；由系统设置下发） */
+  perItemTimeoutMs?: number;
   /** 是否可进入第 3 步「聚合报告」：统计、条款明细、导出 */
   canViewAssessmentResults?: boolean;
   /** 第一个参数固定为当前任务 id，便于在后台跑分析时与「当前选中的任务」解耦 */
@@ -44,10 +50,64 @@ function initialStep(a: Assessment, canViewResults: boolean): 1 | 2 | 3 {
   return 1;
 }
 
+const ANALYSIS_CACHE_KEY = 'ai_guardian_assessment_analysis_cache_v1';
+const MAX_CACHE_ITEMS = 60;
+
+function simpleHash(input: string) {
+  let h = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16);
+}
+
+function loadAnalysisCache(): Record<string, { findings: Finding[]; ts: number }> {
+  try {
+    const raw = localStorage.getItem(ANALYSIS_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, { findings: Finding[]; ts: number }>;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAnalysisCache(cache: Record<string, { findings: Finding[]; ts: number }>) {
+  try {
+    const entries = Object.entries(cache)
+      .sort((a, b) => Number(b[1]?.ts || 0) - Number(a[1]?.ts || 0))
+      .slice(0, MAX_CACHE_ITEMS);
+    localStorage.setItem(ANALYSIS_CACHE_KEY, JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    // ignore localStorage quota errors
+  }
+}
+
+function estimatePublishableGate(evidence: string, findingsCount: number, controlsCount: number) {
+  const normalized = evidence.replace(/\s+/g, ' ').trim();
+  const chars = normalized.length;
+  const distinctChars = new Set(normalized.replace(/\s+/g, '').split('')).size;
+  const lines = evidence
+    .split('\n')
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const uniqueLineRatio = lines.length > 0 ? new Set(lines.map((x) => x.toLowerCase())).size / lines.length : 0;
+  const coverage = controlsCount > 0 ? Math.min(1, findingsCount / controlsCount) : findingsCount > 0 ? 1 : 0;
+  const issues: string[] = [];
+  if (chars < 120) issues.push('evidence_too_short');
+  if (distinctChars < 80) issues.push('evidence_low_distinct_chars');
+  if (uniqueLineRatio < 0.35) issues.push('evidence_repetitive');
+  if (findingsCount > 0 && coverage < 0.7) issues.push('coverage_below_threshold');
+  return { publishable: issues.length === 0, issues, coverage };
+}
+
 export default function AssessmentFlow({
   assessment,
   standards,
   controls: allControls,
+  evalConcurrency = 3,
+  perItemTimeoutMs = 90000,
   canViewAssessmentResults = true,
   onUpdate,
 }: AssessmentFlowProps) {
@@ -80,6 +140,32 @@ export default function AssessmentFlow({
       trustLevel: '可信等级',
       exportExcel: '导出 Excel 基线清单',
       exportWord: '生成评估正式 Word',
+      emptyAnalysis: '该项调研结果为空，请补充对应控制项的检查结果/访谈证据后重新分析。',
+      emptyRecommendation:
+        '请补充该控制项的调研证据（日志截图、配置片段、访谈记录），然后重新执行自动化差距分析。',
+      analysisIncompletePrefix: '自动评估未完成：',
+      retryAfterFailure:
+        '请检查网络与模型配置后重试；或缩小证据文本、在系统设置中提高超时时间。',
+      sheetHeader: '工作表',
+      runInspector: '运行 AI 检查',
+      autoDraftBadge: '自动草稿',
+      analysisFinalizedBadge: '分析已定稿',
+      exportChannelsTitle: '导出渠道',
+      downloadPdfPack: '下载 PDF 包',
+      certifiedSubtitle: '认证复核',
+      reportStatNonCompliant: '不合规',
+      reportStatCompliant: '完全合规',
+      reportStatPartial: '部分合规',
+      priorityPrefix: '优先级',
+      findingCompliant: '完全合规',
+      findingPartial: '部分合规',
+      findingNonCompliant: '不合规',
+      findingNA: '不适用',
+      aiAnalysisHeading: 'AI 分析',
+      aiActionPlanHeading: 'AI 整改建议',
+      basedOn: '依据',
+      noControlsTitle: '该标准尚未配置检查项',
+      noControlsHint: '请先在「合规标准知识库」为该标准新增或导入检查项，再执行评估分析。',
     },
     'en-US': {
       step1: 'Evidence',
@@ -108,9 +194,43 @@ export default function AssessmentFlow({
       trustLevel: 'Trust Level',
       exportExcel: 'Export Excel Baseline',
       exportWord: 'Generate Formal Word Report',
+      emptyAnalysis:
+        'No analysis text was returned. Add inspection or interview evidence for this control, then re-run.',
+      emptyRecommendation:
+        'Add evidence (logs, config excerpts, interview notes) for this control, then run automated gap analysis again.',
+      analysisIncompletePrefix: 'Automatic evaluation did not complete: ',
+      retryAfterFailure:
+        'Check network and model settings, then retry; or shorten evidence / increase timeout in AI settings.',
+      sheetHeader: 'Sheet',
+      runInspector: 'Run AI inspector',
+      autoDraftBadge: 'Auto-draft on',
+      analysisFinalizedBadge: 'Analysis finalized',
+      exportChannelsTitle: 'Export',
+      downloadPdfPack: 'Download PDF pack',
+      certifiedSubtitle: 'Certified review',
+      reportStatNonCompliant: 'Non-compliant',
+      reportStatCompliant: 'Compliant',
+      reportStatPartial: 'Partial',
+      priorityPrefix: 'Priority',
+      findingCompliant: 'Compliant',
+      findingPartial: 'Partial',
+      findingNonCompliant: 'Non-compliant',
+      findingNA: 'Not applicable',
+      aiAnalysisHeading: 'AI analysis',
+      aiActionPlanHeading: 'AI action plan',
+      basedOn: 'Based on',
+      noControlsTitle: 'No controls configured for this standard',
+      noControlsHint: 'Add or import controls for this standard in Standards first, then run the assessment.',
     },
   } as const;
   const t = (k: keyof (typeof T)['zh-CN']) => T[locale][k] || T['zh-CN'][k];
+
+  const findingStatusLabel = (s: Finding['status']) => {
+    if (s === 'Compliant') return t('findingCompliant');
+    if (s === 'Partial') return t('findingPartial');
+    if (s === 'Non-Compliant') return t('findingNonCompliant');
+    return t('findingNA');
+  };
 
   useEffect(() => {
     const onLocale = (e: Event) => {
@@ -127,6 +247,7 @@ export default function AssessmentFlow({
   const [evidenceText, setEvidenceText] = useState(() => assessment.evidenceText ?? '');
   const [isDragging, setIsDragging] = useState(false);
   const [isReadingFile, setIsReadingFile] = useState(false);
+  const [isPrechecking, setIsPrechecking] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const runAnalysisLoopRef = useRef<(opts: { clearFindings: boolean }) => Promise<void>>(async () => {});
 
@@ -139,6 +260,7 @@ export default function AssessmentFlow({
     assessment.findings.length < currentControls.length;
 
   const isAnalyzing = inProgressRun;
+  const hasControls = currentControls.length > 0;
 
   const activeAnalysisId =
     inProgressRun && assessment.findings.length < currentControls.length
@@ -195,7 +317,7 @@ export default function AssessmentFlow({
             const worksheet = workbook.Sheets[sheetName];
             // Convert sheet to text format
             const json = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
-            extractedText += `\n--- 工作表: ${sheetName} ---\n`;
+            extractedText += `\n--- ${t('sheetHeader')}: ${sheetName} ---\n`;
             json.forEach((row: any) => {
               if (Array.isArray(row)) {
                 extractedText += row.join(" | ") + "\n";
@@ -258,6 +380,26 @@ export default function AssessmentFlow({
     const evidence = (evidenceText.trim() || assessment.evidenceText || '').trim();
     if (!evidence) return;
     if (currentControls.length === 0) return;
+    const inputFingerprint = simpleHash(
+      JSON.stringify({
+        standardId: assessment.standardId,
+        evidence,
+        controls: currentControls.map((c) => c.id),
+      })
+    );
+    const cache = loadAnalysisCache();
+    const cached = cache[inputFingerprint];
+    if (opts.clearFindings && cached && Array.isArray(cached.findings) && cached.findings.length > 0) {
+      patch((prev) => ({
+        ...prev,
+        evidenceText: evidence,
+        findings: cached.findings,
+        status: 'Completed',
+        updatedAt: new Date().toISOString(),
+      }));
+      if (canViewAssessmentResults) setStep(3);
+      return;
+    }
 
     const ac = new AbortController();
     registerAnalysisRun(id, ac);
@@ -276,32 +418,10 @@ export default function AssessmentFlow({
       if (opts.clearFindings) findingsSoFar = [];
 
       const pendingControls = currentControls.filter((control) => !findingsSoFar.some((f) => f.controlId === control.id));
-      const rawConcurrency = Number(
-        (() => {
-          try {
-            const raw = localStorage.getItem('ai_guardian_settings_model_v1');
-            if (!raw) return 3;
-            const parsed = JSON.parse(raw) as { evalConcurrency?: number };
-            return parsed.evalConcurrency;
-          } catch {
-            return 3;
-          }
-        })()
-      );
-      const BATCH_SIZE = [2, 3, 5].includes(rawConcurrency) ? rawConcurrency : 3;
-      const perItemTimeoutMs = Number(
-        (() => {
-          try {
-            const raw = localStorage.getItem('ai_guardian_settings_model_v1');
-            if (!raw) return 90000;
-            const parsed = JSON.parse(raw) as { timeoutSec?: number };
-            const sec = Number(parsed.timeoutSec || 90);
-            return Math.min(300000, Math.max(15000, sec * 1000));
-          } catch {
-            return 90000;
-          }
-        })()
-      );
+      const BATCH_SIZE = [2, 3, 5].includes(Number(evalConcurrency)) ? Number(evalConcurrency) : 3;
+      const timeoutMs = Number.isFinite(Number(perItemTimeoutMs))
+        ? Math.min(300000, Math.max(15000, Number(perItemTimeoutMs)))
+        : 90000;
       for (let i = 0; i < pendingControls.length; i += BATCH_SIZE) {
         if (ac.signal.aborted) break;
         const batch = pendingControls.slice(i, i + BATCH_SIZE);
@@ -310,7 +430,17 @@ export default function AssessmentFlow({
             const result = (await Promise.race([
               performGapAnalysis(control, evidence),
               new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error(`单项自动评估超时（>${perItemTimeoutMs}ms）`)), perItemTimeoutMs)
+                setTimeout(
+                  () =>
+                    reject(
+                      new Error(
+                        locale === 'en-US'
+                          ? `Auto evaluation timed out (>${timeoutMs}ms)`
+                          : `单项自动评估超时（>${timeoutMs}ms）`
+                      )
+                    ),
+                  timeoutMs
+                )
               ),
             ])) as GapAnalysisResult;
             const status: Finding['status'] = result.status || 'Non-Compliant';
@@ -323,12 +453,8 @@ export default function AssessmentFlow({
               status,
               attentionState,
               evidence: evidenceField,
-              analysis:
-                (result.analysis || '').trim() ||
-                '该项调研结果为空，请补充对应控制项的检查结果/访谈证据后重新分析。',
-              recommendation:
-                (result.recommendation || '').trim() ||
-                '请补充该控制项的调研证据（日志截图、配置片段、访谈记录），然后重新执行自动化差距分析。',
+              analysis: (result.analysis || '').trim() || t('emptyAnalysis'),
+              recommendation: (result.recommendation || '').trim() || t('emptyRecommendation'),
             };
             return newFinding;
           })
@@ -344,11 +470,8 @@ export default function AssessmentFlow({
             status: 'Non-Compliant' as const,
             attentionState: 'pending' as const,
             evidence: evidenceSnippet,
-            analysis: `自动评估未完成：${reason}`,
-            recommendation:
-              locale === 'en-US'
-                ? 'Check network and model settings, then retry; or reduce evidence size / increase timeout in AI settings.'
-                : '请检查网络与模型配置后重试；或缩小证据文本、在系统设置中提高超时时间。',
+            analysis: `${t('analysisIncompletePrefix')}${reason}`,
+            recommendation: t('retryAfterFailure'),
           };
         });
         findingsSoFar = [...findingsSoFar, ...batchFindings];
@@ -371,15 +494,18 @@ export default function AssessmentFlow({
         }));
         return;
       }
+      const qualityGate = estimatePublishableGate(evidence, findingsSoFar.length, currentControls.length);
 
       patch((prev) => ({
         ...prev,
         findings: findingsSoFar,
         evidenceText: evidence,
-        status: 'Completed',
+        status: qualityGate.publishable ? 'Completed' : 'Draft',
         updatedAt: ts(),
       }));
-      if (canViewAssessmentResults) {
+      cache[inputFingerprint] = { findings: findingsSoFar, ts: Date.now() };
+      saveAnalysisCache(cache);
+      if (canViewAssessmentResults && qualityGate.publishable) {
         setStep(3);
       }
     } finally {
@@ -398,6 +524,11 @@ export default function AssessmentFlow({
     if (format === 'excel') EXPORT_SERVICE.exportToExcel(assessment.findings, currentControls, currentStandard?.name || "");
     if (format === 'word') EXPORT_SERVICE.exportToWord(assessment.findings, currentControls, currentStandard?.name || "", summary);
     if (format === 'pdf') EXPORT_SERVICE.exportToPDF(assessment.findings, currentControls, currentStandard?.name || "");
+    void postReportDownloadEvent({
+      format,
+      assessmentId: assessment.id,
+      standardId: assessment.standardId,
+    }).catch(() => {});
   };
 
   return (
@@ -461,7 +592,7 @@ export default function AssessmentFlow({
                 className="w-full h-[450px] p-8 glass-card bg-white/20 border-white/40 focus:bg-white/40 focus:ring-4 focus:ring-accent/10 transition-all text-sm leading-loose outline-none"
               />
               <div className="absolute top-4 right-4 flex gap-2">
-                <div className="px-2 py-1 bg-accent/10 text-accent text-[10px] font-bold rounded uppercase">Auto-Draft Enabled</div>
+                <div className="px-2 py-1 bg-accent/10 text-accent text-[10px] font-bold rounded uppercase">{t('autoDraftBadge')}</div>
               </div>
             </div>
           </div>
@@ -505,21 +636,54 @@ export default function AssessmentFlow({
             
             <button
               type="button"
-              onClick={() => {
-                const t = evidenceText.trim();
-                if (!t) return;
+              onClick={async () => {
+                const trimmed = evidenceText.trim();
+                if (!trimmed) return;
+                if (!hasControls) {
+                  window.alert(`${t('noControlsTitle')}。${t('noControlsHint')}`);
+                  return;
+                }
+                setIsPrechecking(true);
+                try {
+                  const precheck = await postAssessmentPrecheck({
+                    ...assessment,
+                    evidenceText: trimmed,
+                    findings: assessment.findings || [],
+                    updatedAt: new Date().toISOString(),
+                  });
+                  const blockingIssues = (precheck.issues || []).filter((x) =>
+                    ['evidence_too_short', 'evidence_low_distinct_chars', 'evidence_repetitive', 'evidence_placeholder_like_text'].includes(x)
+                  );
+                  if (blockingIssues.length > 0) {
+                    const proceed = window.confirm(
+                      locale === 'en-US'
+                        ? `Input quality may be too low (${blockingIssues.join(', ')}). Continue anyway?`
+                        : `输入质量可能偏低（${blockingIssues.join('、')}），继续评估可能浪费 AI 资源。是否继续？`
+                    );
+                    if (!proceed) return;
+                  }
+                } catch (error) {
+                  console.warn('Assessment precheck failed:', error);
+                } finally {
+                  setIsPrechecking(false);
+                }
                 patch((prev) => ({
                   ...prev,
-                  evidenceText: t,
+                  evidenceText: trimmed,
                   updatedAt: new Date().toISOString(),
                 }));
                 setStep(2);
               }}
-              disabled={!evidenceText.trim() || isReadingFile}
+              disabled={!evidenceText.trim() || isReadingFile || !hasControls || isPrechecking}
               className="glass-button w-full py-5 text-lg font-black tracking-tight disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {t('start')}
+              {isPrechecking ? t('reading') : t('start')}
             </button>
+            {!hasControls ? (
+              <p className="text-xs font-semibold text-warning-main bg-warning-main/10 border border-warning-main/20 rounded-xl px-3 py-2">
+                {t('noControlsHint')}
+              </p>
+            ) : null}
           </div>
         </motion.div>
       )}
@@ -565,7 +729,7 @@ export default function AssessmentFlow({
                   className="glass-button flex items-center gap-3 px-8 transform hover:translate-x-1"
                 >
                   <Brain size={22} />
-                  Run AI Inspector
+                  {t('runInspector')}
                 </button>
               )}
               {!isAnalyzing && assessment.findings.length > 0 && assessment.status !== 'Completed' && (
@@ -591,6 +755,12 @@ export default function AssessmentFlow({
           </div>
 
           <div className="grid gap-6">
+            {!hasControls ? (
+              <div className="glass-card border border-warning-main/30 bg-warning-main/5 p-5 text-sm">
+                <p className="font-black text-warning-main mb-1">{t('noControlsTitle')}</p>
+                <p className="text-text-main/70">{t('noControlsHint')}</p>
+              </div>
+            ) : null}
             {currentControls.map(control => (
               <div 
                 key={control.id}
@@ -612,7 +782,7 @@ export default function AssessmentFlow({
                           "text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full",
                           control.priority === 'High' ? "bg-danger-main/10 text-danger-main" : "bg-warning-main/10 text-warning-main"
                         )}>
-                          Priority: {control.priority}
+                          {t('priorityPrefix')}: {control.priority}
                         </span>
                       </div>
                     </div>
@@ -680,10 +850,12 @@ export default function AssessmentFlow({
           <div className="flex flex-col lg:flex-row justify-between items-start gap-10 glass-card p-10">
             <div className="flex-1">
               <div className="inline-flex items-center gap-2 px-3 py-1 bg-accent/10 rounded-full text-[10px] font-black text-accent uppercase tracking-widest mb-4">
-                Analysis Finalized
+                {t('analysisFinalizedBadge')}
               </div>
               <h3 className="text-4xl font-black tracking-tight mb-3">{t('maturityTitle')}</h3>
-              <p className="text-lg font-medium text-text-main/50 mb-8 italic">Based on {currentStandard?.name} | Certified Review</p>
+              <p className="text-lg font-medium text-text-main/50 mb-8 italic">
+                {t('basedOn')} {currentStandard?.name} | {t('certifiedSubtitle')}
+              </p>
               
               <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
                 {[
@@ -693,10 +865,15 @@ export default function AssessmentFlow({
                     color: 'text-accent',
                     bg: 'bg-accent/10',
                   },
-                  { label: 'NON-COMPLIANT', val: nonCompliantCount, color: 'text-danger-main', bg: 'bg-danger-main/10' },
-                  { label: 'COMPLIANT', val: compliantCount, color: 'text-success-main', bg: 'bg-success-main/10' },
                   {
-                    label: 'PARTIAL',
+                    label: t('reportStatNonCompliant'),
+                    val: nonCompliantCount,
+                    color: 'text-danger-main',
+                    bg: 'bg-danger-main/10',
+                  },
+                  { label: t('reportStatCompliant'), val: compliantCount, color: 'text-success-main', bg: 'bg-success-main/10' },
+                  {
+                    label: t('reportStatPartial'),
                     val: partialCount,
                     color: 'text-warning-main',
                     bg: 'bg-warning-main/10',
@@ -712,7 +889,7 @@ export default function AssessmentFlow({
             </div>
 
             <div className="flex flex-col gap-3 w-full lg:w-72">
-               <p className="text-[10px] font-black text-text-main/40 uppercase tracking-widest mb-1 ml-1">Export Channels</p>
+               <p className="text-[10px] font-black text-text-main/40 uppercase tracking-widest mb-1 ml-1">{t('exportChannelsTitle')}</p>
               <button onClick={() => handleExport('excel')} className="glass-button bg-success-main flex items-center justify-start gap-4 px-6 py-4 shadow-success-main/10">
                 <TableIcon size={20} />
                 <span className="flex-1 text-left">{t('exportExcel')}</span>
@@ -723,7 +900,7 @@ export default function AssessmentFlow({
               </button>
               <button onClick={() => handleExport('pdf')} className="glass-button bg-danger-main flex items-center justify-start gap-4 px-6 py-4 shadow-danger-main/10">
                 <Download size={20} />
-                <span className="flex-1 text-left">Download PDF Pack</span>
+                <span className="flex-1 text-left">{t('downloadPdfPack')}</span>
               </button>
             </div>
           </div>
@@ -742,7 +919,7 @@ export default function AssessmentFlow({
                       finding.status === 'Compliant' ? "bg-success-main/10 text-success-main" :
                       finding.status === 'Partial' ? "bg-warning-main/10 text-warning-main" : "bg-danger-main/10 text-danger-main"
                     )}>
-                      {finding.status}
+                      {findingStatusLabel(finding.status)}
                     </div>
                   </div>
 
@@ -752,13 +929,13 @@ export default function AssessmentFlow({
                   <div className="mt-auto space-y-4 pt-6 border-t border-white/40">
                     <div className="relative">
                       <h5 className="text-[9px] font-black text-accent uppercase tracking-widest mb-2 flex items-center gap-2">
-                        <Search size={12} /> AI Analysis
+                        <Search size={12} /> {t('aiAnalysisHeading')}
                       </h5>
                       <p className="text-xs font-medium leading-relaxed opacity-80">{finding.analysis}</p>
                     </div>
                     <div className="relative p-3 rounded-xl bg-white/40 border border-white/60">
                       <h5 className="text-[9px] font-black text-warning-main uppercase tracking-widest mb-2 flex items-center gap-2">
-                        <AlertCircle size={12} /> AI Action Plan
+                        <AlertCircle size={12} /> {t('aiActionPlanHeading')}
                       </h5>
                       <p className="text-xs font-bold leading-relaxed text-warning-main/90">{finding.recommendation}</p>
                     </div>

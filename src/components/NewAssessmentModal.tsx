@@ -2,9 +2,12 @@ import React, { useState, useEffect } from 'react';
 import { X } from 'lucide-react';
 import type { Standard } from '../types';
 import type { CompanyProfile, ProjectProfile } from '../permissions';
+import type { LocaleId } from '../i18n';
 
 export interface NewAssessmentModalProps {
   open: boolean;
+  /** 与顶栏语言一致；缺省为 zh-CN */
+  locale?: LocaleId;
   onClose: () => void;
   /** 可选合规标准（内置 + 自定义合并） */
   standards: Standard[];
@@ -21,8 +24,40 @@ export function buildAssessmentDisplayName(standardName: string, customerName: s
   return `${standardName} · ${c} · ${p}`;
 }
 
+const MODAL_COPY = {
+  'zh-CN': {
+    title: '新建分析引擎',
+    subtitle: '请选择合规标准并填写客户与项目信息，系统将据此生成评估任务名称。',
+    close: '关闭',
+    standard: '合规标准',
+    company: '客户公司（权限内）',
+    project: '项目（权限内）',
+    pickCompany: '请选择客户公司',
+    pickProject: '请选择项目',
+    prefilled: '已自动带出',
+    previewTitle: '任务名称预览',
+    cancel: '取消',
+    submit: '创建并进入',
+  },
+  'en-US': {
+    title: 'New assessment',
+    subtitle: 'Pick a standard and company/project (within your access). The task name is generated from these fields.',
+    close: 'Close',
+    standard: 'Compliance standard',
+    company: 'Company (within access)',
+    project: 'Project (within access)',
+    pickCompany: 'Select a company',
+    pickProject: 'Select a project',
+    prefilled: 'Prefilled',
+    previewTitle: 'Task name preview',
+    cancel: 'Cancel',
+    submit: 'Create and open',
+  },
+} as const;
+
 export default function NewAssessmentModal({
   open,
+  locale = 'zh-CN',
   onClose,
   onConfirm,
   standards,
@@ -31,6 +66,7 @@ export default function NewAssessmentModal({
   visibleCompanyIds = [],
   visibleProjectIds = [],
 }: NewAssessmentModalProps) {
+  const m = MODAL_COPY[locale] || MODAL_COPY['zh-CN'];
   const [standardId, setStandardId] = useState(standards[0]?.id ?? '');
   const [companyId, setCompanyId] = useState('');
   const [projectId, setProjectId] = useState('');
@@ -83,18 +119,18 @@ export default function NewAssessmentModal({
         <div className="flex items-start justify-between gap-4">
           <div>
             <h3 id="new-assessment-title" className="text-xl font-black">
-              新建分析引擎
+              {m.title}
             </h3>
-            <p className="text-sm text-text-main/55 font-medium mt-1">请选择合规标准并填写客户与项目信息，系统将据此生成评估任务名称。</p>
+            <p className="text-sm text-text-main/55 font-medium mt-1">{m.subtitle}</p>
           </div>
-          <button type="button" onClick={onClose} className="p-2 rounded-lg hover:bg-white/50 text-text-main/50" aria-label="关闭">
+          <button type="button" onClick={onClose} className="p-2 rounded-lg hover:bg-white/50 text-text-main/50" aria-label={m.close}>
             <X size={20} />
           </button>
         </div>
 
         <div className="space-y-4">
           <div>
-            <label className="text-[10px] font-black text-text-main/40 uppercase tracking-widest ml-1">合规标准</label>
+            <label className="text-[10px] font-black text-text-main/40 uppercase tracking-widest ml-1">{m.standard}</label>
             <select
               value={standardId}
               onChange={(e) => setStandardId(e.target.value)}
@@ -108,7 +144,7 @@ export default function NewAssessmentModal({
             </select>
           </div>
           <div>
-            <label className="text-[10px] font-black text-text-main/40 uppercase tracking-widest ml-1">客户公司（权限内）</label>
+            <label className="text-[10px] font-black text-text-main/40 uppercase tracking-widest ml-1">{m.company}</label>
             <select
               value={companyId}
               onChange={(e) => {
@@ -119,7 +155,7 @@ export default function NewAssessmentModal({
               }}
               className="glass-input w-full px-4 py-3 text-sm font-semibold mt-2"
             >
-              <option value="">请选择客户公司</option>
+              <option value="">{m.pickCompany}</option>
               {scopedCompanies.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.name}
@@ -128,7 +164,7 @@ export default function NewAssessmentModal({
             </select>
           </div>
           <div>
-            <label className="text-[10px] font-black text-text-main/40 uppercase tracking-widest ml-1">项目（权限内）</label>
+            <label className="text-[10px] font-black text-text-main/40 uppercase tracking-widest ml-1">{m.project}</label>
             <select
               value={projectId}
               onChange={(e) => {
@@ -137,7 +173,7 @@ export default function NewAssessmentModal({
               }}
               className="glass-input w-full px-4 py-3 text-sm font-semibold mt-2"
             >
-              <option value="">请选择项目</option>
+              <option value="">{m.pickProject}</option>
               {scopedProjects.map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.name}
@@ -146,18 +182,18 @@ export default function NewAssessmentModal({
             </select>
           </div>
           <p className="text-xs text-text-main/55 font-semibold">
-            已自动带出：{customerName || '—'} / {projectName || '—'}
+            {m.prefilled}：{customerName || '—'} / {projectName || '—'}
           </p>
         </div>
 
         <div className="rounded-xl border border-white/50 bg-white/25 px-4 py-3">
-          <p className="text-[10px] font-black text-text-main/45 uppercase tracking-widest mb-1">任务名称预览</p>
+          <p className="text-[10px] font-black text-text-main/45 uppercase tracking-widest mb-1">{m.previewTitle}</p>
           <p className="text-sm font-bold text-text-main/90 leading-snug break-words">{preview}</p>
         </div>
 
         <div className="flex flex-wrap gap-3 justify-end pt-2">
           <button type="button" className="glass-card px-5 py-2.5 text-sm font-bold hover:bg-white/70" onClick={onClose}>
-            取消
+            {m.cancel}
           </button>
           <button
             type="button"
@@ -165,7 +201,7 @@ export default function NewAssessmentModal({
             onClick={submit}
             disabled={!standardId || !companyId || !projectId || !customerName.trim() || !projectName.trim()}
           >
-            创建并进入
+            {m.submit}
           </button>
         </div>
       </div>
