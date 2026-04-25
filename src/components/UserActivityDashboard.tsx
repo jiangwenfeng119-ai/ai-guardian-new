@@ -79,7 +79,10 @@ export default function UserActivityDashboard({
           <div>
             <h2 className="text-2xl font-black">{tx('用户活跃度分析', 'User Activity Analytics')}</h2>
             <p className="text-sm text-text-main/60 mt-1">
-              {tx('查看登录、评估、报告下载与标准维护的用户行为趋势', 'View user behavior trends for login, assessments, report export, and standards updates')}
+              {tx(
+                '查看登录、评估、报告下载、Bug 提交与标准维护的用户行为趋势',
+                'View user behavior trends for login, assessments, report export, bug submissions, and standards updates'
+              )}
             </p>
           </div>
           <button
@@ -126,7 +129,7 @@ export default function UserActivityDashboard({
 
       {data && (
         <>
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
             <div className="glass-card p-5">
               <p className="text-xs font-black uppercase tracking-widest text-text-main/45">{tx('活跃用户', 'Active users')}</p>
               <p className="text-3xl font-black mt-2">{data.summary.activeUsers}</p>
@@ -142,6 +145,10 @@ export default function UserActivityDashboard({
             <div className="glass-card p-5">
               <p className="text-xs font-black uppercase tracking-widest text-text-main/45">{tx('报告下载', 'Report downloads')}</p>
               <p className="text-3xl font-black mt-2">{data.summary.totalReportsDownloaded}</p>
+            </div>
+            <div className="glass-card p-5">
+              <p className="text-xs font-black uppercase tracking-widest text-text-main/45">{tx('Bug 提交', 'Bug submissions')}</p>
+              <p className="text-3xl font-black mt-2">{data.summary.totalBugSubmitted}</p>
             </div>
           </div>
 
@@ -178,6 +185,7 @@ export default function UserActivityDashboard({
                     <Legend />
                     <Line type="monotone" dataKey="assessmentCreatedCount" stroke="#8b5cf6" name={tx('评估发起', 'Assessments')} strokeWidth={2} dot={false} />
                     <Line type="monotone" dataKey="reportDownloadedCount" stroke="#f59e0b" name={tx('下载报告', 'Downloads')} strokeWidth={2} dot={false} />
+                    <Line type="monotone" dataKey="bugSubmittedCount" stroke="#06b6d4" name={tx('Bug提交', 'Bug submissions')} strokeWidth={2} dot={false} />
                     <Line type="monotone" dataKey="standardsUpdatedCount" stroke="#ef4444" name={tx('标准更新', 'Standards')} strokeWidth={2} dot={false} />
                   </LineChart>
                 </ResponsiveContainer>
@@ -200,6 +208,7 @@ export default function UserActivityDashboard({
                     <th className="py-2 pr-3">{tx('登录', 'Logins')}</th>
                     <th className="py-2 pr-3">{tx('评估', 'Assessments')}</th>
                     <th className="py-2 pr-3">{tx('下载', 'Downloads')}</th>
+                    <th className="py-2 pr-3">{tx('Bug', 'Bugs')}</th>
                     <th className="py-2 pr-3">{tx('活跃天数', 'Active days')}</th>
                     <th className="py-2 pr-3">{tx('最近活跃', 'Last active')}</th>
                   </tr>
@@ -217,6 +226,7 @@ export default function UserActivityDashboard({
                       <td className="py-2 pr-3">{u.loginOkCount}</td>
                       <td className="py-2 pr-3">{u.assessmentsCreatedCount}</td>
                       <td className="py-2 pr-3">{u.reportsDownloadedCount}</td>
+                      <td className="py-2 pr-3">{u.bugSubmittedCount}</td>
                       <td className="py-2 pr-3">{u.activeDays}</td>
                       <td className="py-2 pr-3">{u.lastActiveAt ? new Date(u.lastActiveAt).toLocaleString() : '—'}</td>
                     </tr>
@@ -252,6 +262,7 @@ export default function UserActivityDashboard({
               <div><span className="text-text-main/55">{tx('发起评估', 'Assessments created')}：</span>{selectedUser.assessmentsCreatedCount}</div>
               <div><span className="text-text-main/55">{tx('保存评估', 'Assessments saved')}：</span>{selectedUser.assessmentsSavedCount}</div>
               <div><span className="text-text-main/55">{tx('下载报告', 'Reports downloaded')}：</span>{selectedUser.reportsDownloadedCount}</div>
+              <div><span className="text-text-main/55">{tx('Bug 提交', 'Bug submissions')}：</span>{selectedUser.bugSubmittedCount}</div>
               <div><span className="text-text-main/55">{tx('标准更新', 'Standards updated')}：</span>{selectedUser.standardsUpdatedCount}</div>
               <div><span className="text-text-main/55">{tx('配置更新', 'Settings updates')}：</span>{selectedUser.settingsUpdatedCount}</div>
               <div><span className="text-text-main/55">{tx('平均会话间隔(小时)', 'Avg session gap (hours)')}：</span>{selectedUser.avgSessionGapHours ?? '—'}</div>

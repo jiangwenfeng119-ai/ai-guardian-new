@@ -64,6 +64,7 @@ export type UserActivityAnalyticsResponse = {
     totalLoginOk: number;
     totalAssessmentsCreated: number;
     totalReportsDownloaded: number;
+    totalBugSubmitted: number;
     totalStandardsUpdated: number;
     scoreDistribution: { high: number; medium: number; low: number };
   };
@@ -73,6 +74,7 @@ export type UserActivityAnalyticsResponse = {
     loginCount: number;
     assessmentCreatedCount: number;
     reportDownloadedCount: number;
+    bugSubmittedCount: number;
     standardsUpdatedCount: number;
   }>;
   users: Array<{
@@ -91,10 +93,24 @@ export type UserActivityAnalyticsResponse = {
     assessmentsCreatedCount: number;
     assessmentsSavedCount: number;
     reportsDownloadedCount: number;
+    bugSubmittedCount: number;
+    bugStatusUpdatedCount: number;
     standardsUpdatedCount: number;
     settingsUpdatedCount: number;
     avgSessionGapHours: number | null;
   }>;
+};
+
+export type BugTicket = {
+  id: string;
+  title: string;
+  description: string;
+  status: 'submitted' | 'in_progress' | 'resolved';
+  reporterId: string;
+  reporterName: string;
+  createdAt: string;
+  updatedAt: string;
+  updatedBy?: string;
 };
 
 export async function fetchUserActivityAnalytics(params?: {
@@ -130,6 +146,35 @@ export async function postReportDownloadEvent(body: { format: 'excel' | 'word' |
   checkSession(res);
   if (!res.ok) throw new Error(await parseError(res));
   return res.json() as Promise<{ ok: boolean }>;
+}
+
+export async function fetchBugs(opts?: { signal?: AbortSignal }) {
+  const res = await fetch('/api/bugs', { headers: { ...authHeaders() }, signal: opts?.signal });
+  checkSession(res);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json() as Promise<{ bugs: BugTicket[] }>;
+}
+
+export async function postBug(body: { title: string; description?: string }) {
+  const res = await fetch('/api/bugs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(body),
+  });
+  checkSession(res);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json() as Promise<{ bug: BugTicket }>;
+}
+
+export async function patchBugStatus(id: string, status: 'submitted' | 'in_progress' | 'resolved') {
+  const res = await fetch(`/api/bugs/${encodeURIComponent(id)}/status`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ status }),
+  });
+  checkSession(res);
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json() as Promise<{ bug: BugTicket }>;
 }
 
 export async function postModelConnectionTest(

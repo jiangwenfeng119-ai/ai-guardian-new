@@ -27,6 +27,7 @@ const SETTINGS_PATH = path.join(DATA_DIR, 'settings.json');
 const LEGAL_REGULATIONS_CACHE_PATH = path.join(DATA_DIR, 'legal-regulations-cache.json');
 const LEGAL_REGULATIONS_HISTORY_PATH = path.join(DATA_DIR, 'legal-regulations-history.json');
 const ASSESSMENTS_PATH = path.join(DATA_DIR, 'assessments.json');
+const BUGS_PATH = path.join(DATA_DIR, 'bugs.json');
 const AUDIT_PATH = path.join(DATA_DIR, 'audit.jsonl');
 const AUDIT_RETENTION_DAYS = 180;
 const AUDIT_RETENTION_MS = AUDIT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -367,6 +368,8 @@ function buildUserActivityAnalytics({ days = 30, role = 'all', companyId = 'all'
         assessmentsCreatedCount: 0,
         assessmentsSavedCount: 0,
         reportsDownloadedCount: 0,
+        bugSubmittedCount: 0,
+        bugStatusUpdatedCount: 0,
         standardsUpdatedCount: 0,
         settingsUpdatedCount: 0,
         activeDaysSet: new Set(),
@@ -405,6 +408,7 @@ function buildUserActivityAnalytics({ days = 30, role = 'all', companyId = 'all'
           loginCount: 0,
           assessmentCreatedCount: 0,
           reportDownloadedCount: 0,
+          bugSubmittedCount: 0,
           standardsUpdatedCount: 0,
         });
       }
@@ -440,6 +444,11 @@ function buildUserActivityAnalytics({ days = 30, role = 'all', companyId = 'all'
     } else if (action === 'reports.download') {
       bucket.reportsDownloadedCount += 1;
       if (day) byDay.get(day).reportDownloadedCount += 1;
+    } else if (action === 'bugs.submit') {
+      bucket.bugSubmittedCount += 1;
+      if (day) byDay.get(day).bugSubmittedCount += 1;
+    } else if (action === 'bugs.status.update') {
+      bucket.bugStatusUpdatedCount += 1;
     } else if (action === 'standards.update') {
       bucket.standardsUpdatedCount += 1;
       if (day) byDay.get(day).standardsUpdatedCount += 1;
@@ -459,6 +468,7 @@ function buildUserActivityAnalytics({ days = 30, role = 'all', companyId = 'all'
   const maxAssess = Math.max(1, ...filtered.map((u) => u.assessmentsCreatedCount + u.assessmentsSavedCount));
   const maxReport = Math.max(1, ...filtered.map((u) => u.reportsDownloadedCount));
   const maxStd = Math.max(1, ...filtered.map((u) => u.standardsUpdatedCount + u.settingsUpdatedCount));
+  const maxBug = Math.max(1, ...filtered.map((u) => u.bugSubmittedCount));
 
   const usersOut = filtered
     .map((u) => {
@@ -466,8 +476,12 @@ function buildUserActivityAnalytics({ days = 30, role = 'all', companyId = 'all'
       const assessmentScore = (u.assessmentsCreatedCount + u.assessmentsSavedCount) / maxAssess;
       const reportScore = u.reportsDownloadedCount / maxReport;
       const standardsScore = (u.standardsUpdatedCount + u.settingsUpdatedCount) / maxStd;
+      const bugBehaviorScore = u.bugSubmittedCount / maxBug;
       const activityScore = Math.round(
-        Math.min(100, 100 * (0.2 * loginScore + 0.4 * assessmentScore + 0.2 * reportScore + 0.2 * standardsScore))
+        Math.min(
+          100,
+          100 * (0.05 * loginScore + 0.3 * assessmentScore + 0.2 * reportScore + 0.25 * standardsScore + 0.25 * bugBehaviorScore)
+        )
       );
       const activeDays = u.activeDaysSet.size;
       const loginTotal = u.loginOkCount + u.loginFailCount;
@@ -490,6 +504,8 @@ function buildUserActivityAnalytics({ days = 30, role = 'all', companyId = 'all'
         assessmentsCreatedCount: u.assessmentsCreatedCount,
         assessmentsSavedCount: u.assessmentsSavedCount,
         reportsDownloadedCount: u.reportsDownloadedCount,
+        bugSubmittedCount: u.bugSubmittedCount,
+        bugStatusUpdatedCount: u.bugStatusUpdatedCount,
         standardsUpdatedCount: u.standardsUpdatedCount,
         settingsUpdatedCount: u.settingsUpdatedCount,
         avgSessionGapHours,
@@ -505,6 +521,7 @@ function buildUserActivityAnalytics({ days = 30, role = 'all', companyId = 'all'
       loginCount: d.loginCount,
       assessmentCreatedCount: d.assessmentCreatedCount,
       reportDownloadedCount: d.reportDownloadedCount,
+      bugSubmittedCount: d.bugSubmittedCount || 0,
       standardsUpdatedCount: d.standardsUpdatedCount,
     }))
     .sort((a, b) => a.day.localeCompare(b.day));
@@ -521,7 +538,7 @@ function buildUserActivityAnalytics({ days = 30, role = 'all', companyId = 'all'
     dimensions: { role, companyId, projectId },
     metricDefinitions: {
       activityScore:
-        '0-100 weighted score (login 20%, assessments 40%, report download 20%, standards/settings update 20%).',
+        '0-100 weighted score (login 5%, assessments 30%, report download 20%, standards/settings update 25%, bug submission behavior 25%; bug score is normalized by bugSubmittedCount / maxBugSubmittedCount in selected window).',
       loginSuccessRate: 'loginOkCount / (loginOkCount + loginFailCount), null when no login events.',
       activeDays: 'Count of distinct UTC days with at least one tracked event.',
     },
@@ -532,6 +549,7 @@ function buildUserActivityAnalytics({ days = 30, role = 'all', companyId = 'all'
       totalLoginOk: usersOut.reduce((acc, u) => acc + u.loginOkCount, 0),
       totalAssessmentsCreated: usersOut.reduce((acc, u) => acc + u.assessmentsCreatedCount, 0),
       totalReportsDownloaded: usersOut.reduce((acc, u) => acc + u.reportsDownloadedCount, 0),
+      totalBugSubmitted: usersOut.reduce((acc, u) => acc + u.bugSubmittedCount, 0),
       totalStandardsUpdated: usersOut.reduce((acc, u) => acc + u.standardsUpdatedCount, 0),
       scoreDistribution: scoreDist,
     },
@@ -558,6 +576,24 @@ function readAssessmentsStore() {
 function writeAssessmentsStore(payload) {
   ensureDataDir();
   fs.writeFileSync(ASSESSMENTS_PATH, JSON.stringify(payload, null, 2), 'utf8');
+}
+
+function readBugsStore() {
+  ensureDataDir();
+  if (!fs.existsSync(BUGS_PATH)) return { bugs: [] };
+  try {
+    const raw = fs.readFileSync(BUGS_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    return { bugs: Array.isArray(parsed?.bugs) ? parsed.bugs : [] };
+  } catch (e) {
+    console.error('readBugsStore failed', e);
+    return { bugs: [] };
+  }
+}
+
+function writeBugsStore(payload) {
+  ensureDataDir();
+  fs.writeFileSync(BUGS_PATH, JSON.stringify(payload, null, 2), 'utf8');
 }
 
 const ASSESSMENT_STATUS_SET = new Set(['Draft', 'In Progress', 'Completed']);
@@ -2513,6 +2549,60 @@ app.post('/api/reports/download-event', requireAuth, (req, res) => {
     },
   });
   res.json({ ok: true });
+});
+
+app.get('/api/bugs', requireAuth, (_req, res) => {
+  const store = readBugsStore();
+  const bugs = [...store.bugs].sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  res.json({ bugs });
+});
+
+app.post('/api/bugs', requireAuth, (req, res) => {
+  const title = String(req.body?.title || '').trim();
+  const description = String(req.body?.description || '').trim();
+  if (!title) return res.status(400).json({ error: 'title 不能为空' });
+  const now = new Date().toISOString();
+  const item = {
+    id: `bug_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+    title,
+    description,
+    status: 'submitted',
+    reporterId: req.user.id,
+    reporterName: req.user.username,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const store = readBugsStore();
+  store.bugs.unshift(item);
+  writeBugsStore(store);
+  appendAudit({
+    action: 'bugs.submit',
+    actor: req.user.username,
+    detail: { bugId: item.id, titleLen: item.title.length },
+  });
+  res.json({ bug: item });
+});
+
+app.patch('/api/bugs/:id/status', requireAuth, (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const status = String(req.body?.status || '').trim();
+  const allowed = new Set(['submitted', 'in_progress', 'resolved']);
+  if (!allowed.has(status)) {
+    return res.status(400).json({ error: 'status 必须是 submitted/in_progress/resolved' });
+  }
+  const store = readBugsStore();
+  const idx = store.bugs.findIndex((x) => String(x?.id || '') === id);
+  if (idx < 0) return res.status(404).json({ error: 'bug 不存在' });
+  const prev = store.bugs[idx];
+  const next = { ...prev, status, updatedAt: new Date().toISOString(), updatedBy: req.user.username };
+  store.bugs[idx] = next;
+  writeBugsStore(store);
+  appendAudit({
+    action: 'bugs.status.update',
+    actor: req.user.username,
+    detail: { bugId: id, from: String(prev?.status || ''), to: status },
+  });
+  res.json({ bug: next });
 });
 
 app.get('/api/analytics/user-activity', requireAuth, (req, res) => {

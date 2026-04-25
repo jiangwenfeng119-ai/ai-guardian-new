@@ -265,6 +265,8 @@ async function ollamaChat(settings: AiModelSettings, profile: AiEndpointProfile,
       throw new Error('Ollama 返回空内容');
     }
     return text;
+  } catch (e) {
+    throw e;
   } finally {
     clearTimeout(t);
   }
@@ -315,6 +317,8 @@ async function openaiCompatibleChat(settings: AiModelSettings, userPrompt: strin
       throw new Error('OpenAI 兼容接口返回空内容');
     }
     return text;
+  } catch (e) {
+    throw e;
   } finally {
     clearTimeout(t);
   }
@@ -482,32 +486,74 @@ function chooseRoute(settings: AiModelSettings, evidenceText: string, preferClou
 }
 
 async function runWithRoute(settings: AiModelSettings, route: AiRoute, prompt: string): Promise<string> {
+  const serverFallback = async (mode: 'local' | 'cloud') => {
+    const token = getAuthToken();
+    if (!token) throw new Error('missing auth token for server model fallback');
+    const r = await fetch('/api/ai-assistant/chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ message: prompt, mode }),
+    });
+    const data = (await r.json().catch(() => ({}))) as { ok?: boolean; text?: string; error?: string };
+    if (!r.ok || data.ok === false || !String(data.text || '').trim()) {
+      throw new Error(data.error || `server fallback failed: ${r.status}`);
+    }
+    return String(data.text || '');
+  };
+
   if (route === 'local') {
-    return ollamaChat(settings, resolveLocalProfile(settings), prompt);
+    try {
+      return await ollamaChat(settings, resolveLocalProfile(settings), prompt);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/load failed|failed to fetch|networkerror|fetch is aborted/i.test(msg)) {
+        return serverFallback('local');
+      }
+      throw e;
+    }
   }
   const cloud = resolveCloudProfile(settings);
   if (cloud.provider === 'Gemini') {
-    const ai = getGeminiClient(cloud);
-    if (!ai) throw new Error('未配置 Gemini API Key');
-    const timeoutMs = Math.min(300_000, Math.max(5000, profileTimeoutSec(cloud, settings) * 1000));
-    const response = await Promise.race([
-      ai.models.generateContent({
-        model: cloud.model || 'gemini-2.5-flash',
-        contents: prompt,
-        config: {
-          temperature: profileTemperature(cloud, settings),
-          topP: profileTopP(cloud, settings),
-          maxOutputTokens: Math.min(32768, profileMaxTokens(cloud, settings)),
-        },
-      }),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`Gemini 请求超时（>${timeoutMs}ms）`)), timeoutMs)
-      ),
-    ]);
-    return response.text || '';
+    try {
+      const ai = getGeminiClient(cloud);
+      if (!ai) throw new Error('未配置 Gemini API Key');
+      const timeoutMs = Math.min(300_000, Math.max(5000, profileTimeoutSec(cloud, settings) * 1000));
+      const response = await Promise.race([
+        ai.models.generateContent({
+          model: cloud.model || 'gemini-2.5-flash',
+          contents: prompt,
+          config: {
+            temperature: profileTemperature(cloud, settings),
+            topP: profileTopP(cloud, settings),
+            maxOutputTokens: Math.min(32768, profileMaxTokens(cloud, settings)),
+          },
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`Gemini 请求超时（>${timeoutMs}ms）`)), timeoutMs)
+        ),
+      ]);
+      return response.text || '';
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/load failed|failed to fetch|networkerror|fetch is aborted/i.test(msg)) {
+        return serverFallback('cloud');
+      }
+      throw e;
+    }
   }
   if (isOpenAiCompatProvider(cloud.provider)) {
-    return openaiCompatibleChat(settings, prompt);
+    try {
+      return await openaiCompatibleChat(settings, prompt);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/load failed|failed to fetch|networkerror|fetch is aborted/i.test(msg)) {
+        return serverFallback('cloud');
+      }
+      throw e;
+    }
   }
   throw new Error(`暂不支持云端 Provider：${cloud.provider}`);
 }
@@ -517,9 +563,14 @@ function localKeywordFallback(control: Control, evidenceText: string): Partial<F
   const lowerRequirement = control.requirement.toLowerCase();
   const hasMatch = lowerRequirement.split(/[,，。；;]/).some((keyword) => keyword.trim().length > 3 && lowerEvidence.includes(keyword.trim()));
   return {
-    status: hasMatch ? 'Compliant' : 'Non-Compliant',
-    analysis: hasMatch ? '根据本地分析，输入的证据与合规要求有一定匹配。' : '本地分析：未在证据中找到与该合规要求直接相关的信息。',
-    recommendation: hasMatch ? '建议持续监控和定期审计以确保持续合规。' : '建议补充相关证据材料或手动核实合规状态。',
+    // 保守兜底：模型链路失败时不直接判“合规”，避免未充分核验却全部 Compliant。
+    status: hasMatch ? 'Partial' : 'Non-Compliant',
+    analysis: hasMatch
+      ? '模型链路失败，已执行本地兜底匹配：发现部分证据与控制要求存在关联，但未完成模型级核验，暂不判定为完全合规。'
+      : '模型链路失败，且本地兜底未发现与该控制要求直接相关的充分证据。',
+    recommendation: hasMatch
+      ? '请恢复模型连接后重新执行自动评估；补充关键证据（日志、配置、审批记录）后再确认是否合规。'
+      : '请补充该控制项的直接证据，并在模型连通后重新执行自动评估。',
   };
 }
 
@@ -682,7 +733,8 @@ export async function performGapAnalysis(
     : '(无证据文本)';
   const diagnosticContext = bundle.wasTruncated ? promptEvidenceBody : evidenceText;
   const displayForFinding = (bundle.displayForFinding || promptEvidenceBody || evidenceText).trim();
-  if (isNotApplicableByResearch(control, evidenceText)) {
+  const naDetected = isNotApplicableByResearch(control, evidenceText);
+  if (naDetected) {
     return withEvidenceExcerpt(
       {
         status: 'Not Applicable',
@@ -753,10 +805,8 @@ ${promptEvidenceBody}
   try {
     const text = await runWithRoute(settings, initialRoute, prompt);
     if (initialRoute === 'local') markLocalSuccess();
-    return withEvidenceExcerpt(
-      gapAnalysisFromModelText(text, control, evidenceText, diagnosticContext),
-      displayForFinding
-    );
+    const parsed = gapAnalysisFromModelText(text, control, evidenceText, diagnosticContext);
+    return withEvidenceExcerpt(parsed, displayForFinding);
   } catch (e) {
     if (initialRoute === 'local') markLocalFailure(e);
     console.error('Primary gap analysis failed:', e);
@@ -764,16 +814,15 @@ ${promptEvidenceBody}
       try {
         const text = await runWithRoute(settings, fallbackRoute, prompt);
         if (fallbackRoute === 'local') markLocalSuccess();
-        return withEvidenceExcerpt(
-          gapAnalysisFromModelText(text, control, evidenceText, diagnosticContext),
-          displayForFinding
-        );
+        const parsed = gapAnalysisFromModelText(text, control, evidenceText, diagnosticContext);
+        return withEvidenceExcerpt(parsed, displayForFinding);
       } catch (secondErr) {
         if (fallbackRoute === 'local') markLocalFailure(secondErr);
         console.error('Fallback gap analysis failed:', secondErr);
       }
     }
-    return withEvidenceExcerpt(localKeywordFallback(control, evidenceText), displayForFinding);
+    const local = localKeywordFallback(control, evidenceText);
+    return withEvidenceExcerpt(local, displayForFinding);
   }
 }
 

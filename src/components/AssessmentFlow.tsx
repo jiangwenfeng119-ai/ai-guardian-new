@@ -541,7 +541,14 @@ export default function AssessmentFlow({
     );
     const cache = loadAnalysisCache();
     const cached = cache[inputFingerprint];
-    if (opts.clearFindings && cached && Array.isArray(cached.findings) && cached.findings.length > 0) {
+    const allowCachedReuse = (() => {
+      try {
+        return localStorage.getItem('ai_guardian_enable_cached_assessment_reuse') === '1';
+      } catch {
+        return false;
+      }
+    })();
+    if (allowCachedReuse && opts.clearFindings && cached && Array.isArray(cached.findings) && cached.findings.length > 0) {
       patch((prev) => ({
         ...prev,
         evidenceText: evidence,

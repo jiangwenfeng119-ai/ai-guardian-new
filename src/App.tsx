@@ -8,6 +8,7 @@ import {
   Shield,
   LayoutDashboard,
   Bot,
+  Bug,
   FileText,
   Settings,
   ChevronRight,
@@ -45,6 +46,7 @@ const AiAssistant = lazy(() => import('./components/AiAssistant'));
 const StandardsConfig = lazy(() => import('./components/StandardsConfig'));
 const SystemSettings = lazy(() => import('./components/SystemSettings'));
 const AssessmentFlow = lazy(() => import('./components/AssessmentFlow'));
+const BugTracker = lazy(() => import('./components/BugTracker'));
 const STORAGE_KEY_CATALOG_ENTRIES = 'ai_guardian_catalog_entries_v2';
 
 function TabLoading({ label }: { label: string }) {
@@ -78,6 +80,7 @@ const ALL_NAV = [
   { id: 'assessments' as const, label: 'A', icon: FileText },
   { id: 'standards' as const, label: 'S', icon: Shield },
   { id: 'settings' as const, label: 'C', icon: Settings },
+  { id: 'bugs' as const, label: 'B', icon: Bug },
 ] as const;
 
 const I18N: Record<LocaleId, Record<string, string>> = {
@@ -87,6 +90,7 @@ const I18N: Record<LocaleId, Record<string, string>> = {
     assessments: '评估任务',
     standards: '合规标准',
     settings: '配置',
+    bugs: 'Bug提交',
     logout: '退出',
     init: '正在初始化…',
     loadPerm: '正在加载权限…',
@@ -121,6 +125,7 @@ const I18N: Record<LocaleId, Record<string, string>> = {
     assessments: 'Assessments',
     standards: 'Standards',
     settings: 'Settings',
+    bugs: 'Bugs',
     logout: 'Logout',
     init: 'Initializing…',
     loadPerm: 'Loading permissions…',
@@ -194,7 +199,7 @@ export default function App() {
   } | null>(null);
   const [settingsForPerm, setSettingsForPerm] = useState<Record<string, unknown> | null>(null);
 
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'assistant' | 'assessments' | 'standards' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'assistant' | 'assessments' | 'standards' | 'settings' | 'bugs'>('dashboard');
   const [selectedAssessmentId, setSelectedAssessmentId] = useState<string | null>(null);
   const [newAssessmentOpen, setNewAssessmentOpen] = useState(false);
   const [assessmentCompanyFilter, setAssessmentCompanyFilter] = useState('all');
@@ -456,6 +461,7 @@ export default function App() {
       if (item.id === 'assistant') return true;
       if (item.id === 'assessments') return effectivePermissions.runAssessments;
       if (item.id === 'standards') return effectivePermissions.editStandards;
+      if (item.id === 'bugs') return true;
       if (item.id === 'settings') {
         return (
           effectivePermissions.manageUsers ||
@@ -928,7 +934,9 @@ export default function App() {
                       ? t('assessments')
                       : item.id === 'standards'
                         ? t('standards')
-                        : t('settings')
+                        : item.id === 'settings'
+                          ? t('settings')
+                          : t('bugs')
               }
               aria-label={
                 item.id === 'dashboard'
@@ -939,7 +947,9 @@ export default function App() {
                       ? t('assessments')
                       : item.id === 'standards'
                         ? t('standards')
-                        : t('settings')
+                        : item.id === 'settings'
+                          ? t('settings')
+                          : t('bugs')
               }
               onClick={() => setActiveTab(item.id)}
               className={cn(
@@ -960,7 +970,9 @@ export default function App() {
                       ? t('assessments')
                       : item.id === 'standards'
                         ? t('standards')
-                        : t('settings')}
+                        : item.id === 'settings'
+                          ? t('settings')
+                          : t('bugs')}
               </div>
             </button>
           ))}
@@ -992,7 +1004,9 @@ export default function App() {
                             ? t('assessments')
                             : activeTab === 'standards'
                               ? t('standards')
-                              : t('settings'))}
+                              : activeTab === 'settings'
+                                ? t('settings')
+                                : t('bugs'))}
                 </h1>
               </div>
               {selectedAssessmentId && activeTab !== 'assessments' && canAssess && (
@@ -1328,6 +1342,14 @@ export default function App() {
                     })
                   )}
                 </div>
+              </motion.div>
+            )}
+
+            {activeTab === 'bugs' && (
+              <motion.div key="bugs" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }}>
+                <Suspense fallback={<TabLoading label={t('tabLoading')} />}>
+                  <BugTracker onSessionExpired={handleSessionExpired} />
+                </Suspense>
               </motion.div>
             )}
 
