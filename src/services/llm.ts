@@ -628,6 +628,13 @@ function hasExplicitNaMarker(text: string): boolean {
   return false;
 }
 
+function hasPositiveEvidenceMarker(text: string): boolean {
+  const raw = String(text || '');
+  if (!raw) return false;
+  // Common signals that indicate implemented/available evidence, used to avoid NA false positives.
+  return /(已完成|已提供|已落实|已部署|已启用|通过|具备|存在|可用|有效|有证据|已备案|已测评)/.test(raw);
+}
+
 function isNotApplicableByResearch(control: Control, evidenceText: string): boolean {
   const evidence = String(evidenceText || '');
   if (!hasExplicitNaMarker(evidence)) return false;
@@ -640,18 +647,35 @@ function isNotApplicableByResearch(control: Control, evidenceText: string): bool
   const controlName = normalizeForNaMatch(control.name || '');
 
   // Prefer control-scoped NA evidence to avoid one NA statement affecting all controls.
+  // In table-style evidence (one row per control), require NA marker and control identity on the same row.
+  const lineCandidates = evidence
+    .split('\n')
+    .map((x) => x.trim())
+    .filter(Boolean);
+  for (const line of lineCandidates) {
+    if (!line.includes('|')) continue;
+    if (!hasExplicitNaMarker(line)) continue;
+    const normalizedLine = normalizeForNaMatch(line);
+    const isSameControl =
+      (controlId && normalizedLine.includes(controlId)) || (controlName && normalizedLine.includes(controlName));
+    if (!isSameControl) continue;
+    if (hasPositiveEvidenceMarker(line)) return false;
+    return true;
+  }
+
   for (const block of blocks) {
     if (!hasExplicitNaMarker(block)) continue;
     const normalized = normalizeForNaMatch(block);
-    if ((controlId && normalized.includes(controlId)) || (controlName && normalized.includes(controlName))) {
+    const isSameControl =
+      (controlId && normalized.includes(controlId)) || (controlName && normalized.includes(controlName));
+    if (isSameControl) {
+      if (hasPositiveEvidenceMarker(block)) return false;
       return true;
     }
   }
 
-  // If there is no control identifier at all in the evidence body, treat explicit NA as global.
-  const normalizedAll = normalizeForNaMatch(evidence);
-  const evidenceMentionsControl = (controlId && normalizedAll.includes(controlId)) || (controlName && normalizedAll.includes(controlName));
-  return !evidenceMentionsControl && hasExplicitNaMarker(evidence);
+  // Do not use global NA fallback; otherwise one NA sentence can incorrectly affect all controls.
+  return false;
 }
 
 /**

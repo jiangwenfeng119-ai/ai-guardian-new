@@ -777,6 +777,16 @@ function countParsedEvidenceItems(evidenceText) {
       n === 'checklist'
     );
   };
+  const looksLikeControlId = (value) => {
+    const v = String(value || '').trim();
+    if (!v) return false;
+    // Common control id forms: 1.1.1 / A.1.2 / AC-01 / CTRL_001
+    return (
+      /^\d+(?:\.\d+)+$/.test(v) ||
+      /^[A-Za-z]\d*(?:\.\d+)+$/.test(v) ||
+      /^[A-Za-z]+[-_]\d+(?:[-_.]\d+)*$/i.test(v)
+    );
+  };
 
   let activeSheet = '';
   let sawSheetHeader = false;
@@ -795,6 +805,18 @@ function countParsedEvidenceItems(evidenceText) {
     if (/^(sheet|工作表)\s*[:：]/i.test(line)) continue;
     if (/^(控制项id|检查项名称|合规要求|自动化核查命令|检查结果|合规结论)/i.test(line.replace(/\s+/g, ''))) continue;
     if (line.replace(/[|·•\-\s]/g, '').length < 2) continue;
+    const cols = line.split('|').map((x) => x.trim()).filter(Boolean);
+    if (cols.length > 0) {
+      const c0 = cols[0];
+      if (
+        /^(控制项id|id|检查项名称|名称|说明|备注)$/i.test(c0.replace(/\s+/g, '')) ||
+        /^标准检查清单$/i.test(c0)
+      ) {
+        continue;
+      }
+      // In checklist exports, true data rows should carry a control id in the first column.
+      if (!looksLikeControlId(c0)) continue;
+    }
     count += 1;
   }
   return count;

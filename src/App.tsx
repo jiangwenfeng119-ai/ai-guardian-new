@@ -442,6 +442,8 @@ export default function App() {
     if (!user || !canAssess || !assessmentsHydrated) return;
     const sig = JSON.stringify(assessments);
     if (sig === lastSavedAssessmentsSig.current) return;
+    const hasInProgress = assessments.some((a) => a.status === 'In Progress');
+    const persistDelayMs = hasInProgress ? 30 : 250;
     const timer = setTimeout(() => {
       void putAssessments(assessments)
         .then(() => {
@@ -450,7 +452,7 @@ export default function App() {
         .catch((e) => {
           console.error('Failed to save assessments to server:', e);
         });
-    }, 250);
+    }, persistDelayMs);
     return () => clearTimeout(timer);
   }, [assessments, user, canAssess, assessmentsHydrated]);
 
@@ -1253,6 +1255,10 @@ export default function App() {
                   ) : (
                     filteredAssessments.map((item) => {
                       const cardStats = item.status === 'Completed' ? completedTaskFindingStats(item.findings) : null;
+                      const controlsTotal = Math.max(0, controls[item.standardId]?.length || 0);
+                      const coveredControls = new Set(
+                        (item.findings || []).map((f) => String(f.controlId || '').trim()).filter(Boolean)
+                      ).size;
                       const companyLabel = item.companyId ? companyNameById[item.companyId] || item.customerName || item.companyId : item.customerName || '—';
                       const projectLabel = item.projectId ? projectNameById[item.projectId] || item.projectName || item.projectId : item.projectName || '—';
                       return (
@@ -1349,8 +1355,10 @@ export default function App() {
                               );
                             }}
                           >
-                            {item.status === 'Draft'
-                              ? tx('启动评估', 'Start Assessment')
+                            {item.status === 'Draft' && coveredControls > 0
+                              ? tx('继续评估', 'Resume Assessment')
+                              : item.status === 'Draft'
+                                ? tx('启动评估', 'Start Assessment')
                               : tx('重新评估', 'Re-run Assessment')}
                           </button>
                         )}
@@ -1397,7 +1405,9 @@ export default function App() {
                             <CheckCircle2 size={14} />
                             {item.status === 'Completed' && cardStats
                               ? tx(`${cardStats.total} 条检查项`, `${cardStats.total} controls`)
-                              : tx(`${item.findings.length} 条发现项`, `${item.findings.length} findings`)}
+                              : controlsTotal > 0
+                                ? tx(`进度 ${coveredControls}/${controlsTotal}`, `Progress ${coveredControls}/${controlsTotal}`)
+                                : tx(`${item.findings.length} 条发现项`, `${item.findings.length} findings`)}
                           </div>
                           <div className="flex items-center gap-1">
                             <User size={14} />
