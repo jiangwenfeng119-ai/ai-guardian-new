@@ -157,16 +157,18 @@ const DEFAULT_SETTINGS = {
   permissions: null,
   assessmentQuality: {
     maxAssessmentsPerRequest: 200,
-    maxEvidenceChars: 200000,
-    minEvidenceChars: 120,
-    minDistinctEvidenceChars: 80,
-    minCoverageRatioForPublish: 0.7,
-    minEvidencePerFindingChars: 20,
-    minUniqueEvidenceRatio: 0.35,
+    maxEvidenceChars: 220000,
+    minEvidenceChars: 220,
+    minDistinctEvidenceChars: 120,
+    minCoverageRatioForPublish: 0.8,
+    minEvidencePerFindingChars: 25,
+    minUniqueEvidenceRatio: 0.4,
     maxFindingTextChars: 15000,
     maxNameChars: 160,
     maxProjectLabelChars: 80,
     maxIdChars: 120,
+    enforcementMode: 'soft',
+    hardIssueCodes: ['coverage_below_threshold', 'evidence_too_short'],
   },
 };
 
@@ -572,16 +574,18 @@ const PLACEHOLDER_PATTERNS = [
 ];
 const DEFAULT_ASSESSMENT_QUALITY_POLICY = {
   maxAssessmentsPerRequest: 200,
-  maxEvidenceChars: 200000,
-  minEvidenceChars: 120,
-  minDistinctEvidenceChars: 80,
-  minCoverageRatioForPublish: 0.7,
-  minEvidencePerFindingChars: 20,
-  minUniqueEvidenceRatio: 0.35,
+  maxEvidenceChars: 220000,
+  minEvidenceChars: 220,
+  minDistinctEvidenceChars: 120,
+  minCoverageRatioForPublish: 0.8,
+  minEvidencePerFindingChars: 25,
+  minUniqueEvidenceRatio: 0.4,
   maxFindingTextChars: 15000,
   maxNameChars: 160,
   maxProjectLabelChars: 80,
   maxIdChars: 120,
+  enforcementMode: 'soft',
+  hardIssueCodes: ['coverage_below_threshold', 'evidence_too_short'],
 };
 
 function clampInt(n, min, max, fallback) {
@@ -651,6 +655,13 @@ function getAssessmentQualityPolicy(settings) {
       DEFAULT_ASSESSMENT_QUALITY_POLICY.maxProjectLabelChars
     ),
     maxIdChars: clampInt(raw.maxIdChars, 20, 200, DEFAULT_ASSESSMENT_QUALITY_POLICY.maxIdChars),
+    enforcementMode:
+      String(raw.enforcementMode || DEFAULT_ASSESSMENT_QUALITY_POLICY.enforcementMode).trim().toLowerCase() === 'hard'
+        ? 'hard'
+        : 'soft',
+    hardIssueCodes: Array.isArray(raw.hardIssueCodes)
+      ? raw.hardIssueCodes.map((x) => String(x).trim()).filter(Boolean).slice(0, 20)
+      : [...DEFAULT_ASSESSMENT_QUALITY_POLICY.hardIssueCodes],
   };
 }
 
@@ -810,6 +821,8 @@ function validateAssessmentRecord(raw, idx, policy, settings) {
   if (evidenceMetrics.placeholderHits > 0) qualityIssues.push('evidence_placeholder_like_text');
   if (findings.length > 0 && evidencePerFindingChars < policy.minEvidencePerFindingChars) qualityIssues.push('evidence_per_finding_too_short');
   if (findings.length > 0 && coverage.ratio < policy.minCoverageRatioForPublish) qualityIssues.push('coverage_below_threshold');
+  const hardIssueCodes = new Set(Array.isArray(policy.hardIssueCodes) ? policy.hardIssueCodes : []);
+  const blockedByGate = policy.enforcementMode === 'hard' && qualityIssues.some((x) => hardIssueCodes.has(x));
   const qualityScore = Math.max(
     0,
     Math.min(
@@ -833,7 +846,7 @@ function validateAssessmentRecord(raw, idx, policy, settings) {
     companyId,
     projectId,
     createdBy,
-    status: publishable && status === 'Completed' ? 'Completed' : status === 'In Progress' ? 'In Progress' : 'Draft',
+    status: blockedByGate && status === 'Completed' ? 'Draft' : status,
     createdAt,
     updatedAt,
     findings,
@@ -842,6 +855,8 @@ function validateAssessmentRecord(raw, idx, policy, settings) {
   normalized.inputFingerprint = hashAssessmentInput(normalized);
   normalized.quality = {
     publishable,
+    blockedByGate,
+    enforcementMode: policy.enforcementMode,
     score: qualityScore,
     confidence: qualityScore >= 85 ? 'High' : qualityScore >= 65 ? 'Medium' : 'Low',
     issues: qualityIssues,

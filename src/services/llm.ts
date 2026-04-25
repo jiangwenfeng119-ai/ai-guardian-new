@@ -560,6 +560,49 @@ function normalizeFindingStatus(input: unknown): Finding['status'] {
   return 'Non-Compliant';
 }
 
+function normalizeForNaMatch(input: string): string {
+  return String(input || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function hasExplicitNaMarker(text: string): boolean {
+  const raw = String(text || '');
+  if (!raw) return false;
+  if (/(status|状态)\s*[:：]\s*(not applicable|不适用|na)\b/i.test(raw)) return true;
+  if (/\bnot\s*applicable\b/i.test(raw)) return true;
+  if (/(^|[：:\-\s])(不适用)([，。；;\s]|$)/.test(raw)) return true;
+  return false;
+}
+
+function isNotApplicableByResearch(control: Control, evidenceText: string): boolean {
+  const evidence = String(evidenceText || '');
+  if (!hasExplicitNaMarker(evidence)) return false;
+
+  const blocks = evidence
+    .split(/\n\s*\n/g)
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const controlId = normalizeForNaMatch(control.id || '');
+  const controlName = normalizeForNaMatch(control.name || '');
+
+  // Prefer control-scoped NA evidence to avoid one NA statement affecting all controls.
+  for (const block of blocks) {
+    if (!hasExplicitNaMarker(block)) continue;
+    const normalized = normalizeForNaMatch(block);
+    if ((controlId && normalized.includes(controlId)) || (controlName && normalized.includes(controlName))) {
+      return true;
+    }
+  }
+
+  // If there is no control identifier at all in the evidence body, treat explicit NA as global.
+  const normalizedAll = normalizeForNaMatch(evidence);
+  const evidenceMentionsControl = (controlId && normalizedAll.includes(controlId)) || (controlName && normalizedAll.includes(controlName));
+  return !evidenceMentionsControl && hasExplicitNaMarker(evidence);
+}
+
 /**
  * 将模型原文转为 Finding 片段：优先解析 JSON；解析失败时保留摘录便于排错，避免静默空结果。
  * @param evidenceTextForFallback 全文，用于关键词兜底
@@ -639,6 +682,17 @@ export async function performGapAnalysis(
     : '(无证据文本)';
   const diagnosticContext = bundle.wasTruncated ? promptEvidenceBody : evidenceText;
   const displayForFinding = (bundle.displayForFinding || promptEvidenceBody || evidenceText).trim();
+  if (isNotApplicableByResearch(control, evidenceText)) {
+    return withEvidenceExcerpt(
+      {
+        status: 'Not Applicable',
+        analysis:
+          '人工调研结果已明确标注本控制项为“不适用（Not Applicable）”，本次已跳过大模型评估。请在审计复核时确认该不适用范围与边界持续成立。',
+        recommendation: '建议保留不适用判定依据（业务范围、系统边界、职责边界）并按周期复核。',
+      },
+      displayForFinding
+    );
+  }
 
   const prompt = `你是一个专业的网络安全合规评估专家。
 请对比以下"合规要求项"与"检查结果/访谈记录"，进行差距分析。
@@ -662,7 +716,15 @@ ${promptEvidenceBody}
   "recommendation": "整改建议"
 }
 
-注意：如果检查结果中没有提到相关信息，状态应为 Non-Compliant，并在建议中指明。只输出 JSON，不要其它说明文字。${
+【Evidence Quality Contract - 业务可用模式】
+1) 只能依据输入证据判断，不得虚构系统、配置、日志、人员、时间。
+2) 证据不完美但有部分事实时，优先给 Partial；仅在关键要求完全无证据或有明显反证时给 Non-Compliant。
+3) analysis 先写已确认事实，再写缺失信息/不确定点，最后写风险影响；如有不确定性请写“置信度：High/Medium/Low”。
+4) recommendation 必须可执行，至少包含动作 + 责任角色 + 建议时限；证据不足时第一条先写“补证动作”。
+5) 若输出 Compliant，必须给出至少 2 个事实依据；不足时降为 Partial。
+6) 若人工调研明确写了“Not Applicable/不适用”，应判定 Not Applicable，不要给整改动作。
+
+注意：只输出 JSON，不要其它说明文字。${
     bundle.wasTruncated
       ? '\n说明：上列为证据节选，未展示部分可能仍含与结论相关的信息；若节选不足以判断，请在 analysis 中明确写出「信息不足/未见反证」等限定语。'
       : ''
