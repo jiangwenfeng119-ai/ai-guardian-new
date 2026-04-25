@@ -626,11 +626,17 @@ export default function AssessmentFlow({
           const evidenceSnippet = evidence.length > 500 ? `${evidence.slice(0, 500)}…` : evidence;
           return {
             controlId: control.id,
-            status: 'Non-Compliant' as const,
+            status: 'Partial' as const,
             attentionState: 'pending' as const,
             evidence: evidenceSnippet,
-            analysis: `${t('analysisIncompletePrefix')}${reason}`,
-            recommendation: t('retryAfterFailure'),
+            analysis:
+              locale === 'en-US'
+                ? `Analysis failed for this control item: ${reason}`
+                : `该控制项分析失败：${reason}`,
+            recommendation:
+              locale === 'en-US'
+                ? 'Please rerun this assessment item after checking model connectivity and timeout settings.'
+                : '请检查模型联通性与超时配置后，重新运行该评估项。',
           };
         });
         findingsSoFar = [...findingsSoFar, ...batchFindings];
@@ -847,16 +853,14 @@ export default function AssessmentFlow({
                     findings: assessment.findings || [],
                     updatedAt: new Date().toISOString(),
                   });
-                  const blockingIssues = (precheck.issues || []).filter((x) =>
-                    ['evidence_too_short', 'evidence_low_distinct_chars', 'evidence_repetitive', 'evidence_placeholder_like_text'].includes(x)
-                  );
-                  if (blockingIssues.length > 0) {
-                    const proceed = window.confirm(
-                      locale === 'en-US'
-                        ? `Input quality may be too low (${blockingIssues.join(', ')}). Continue anyway?`
-                        : `输入质量可能偏低（${blockingIssues.join('、')}），继续评估可能浪费 AI 资源。是否继续？`
+                  if (!precheck.matched) {
+                    window.alert(
+                      precheck.message ||
+                        (locale === 'en-US'
+                          ? `Research items (${precheck.parsedItemCount}) do not match standard controls (${precheck.standardControlCount}). Please update the research file and retry.`
+                          : `调研条目数（${precheck.parsedItemCount}）与标准条款数（${precheck.standardControlCount}）不一致，请检查并更新调研文件后重试。`)
                     );
-                    if (!proceed) return;
+                    return;
                   }
                 } catch (error) {
                   console.warn('Assessment precheck failed:', error);

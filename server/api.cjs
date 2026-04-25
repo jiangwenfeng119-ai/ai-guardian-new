@@ -755,6 +755,23 @@ function calculateCoverageRatio(assessment, settings) {
   };
 }
 
+function countParsedEvidenceItems(evidenceText) {
+  const lines = String(evidenceText || '')
+    .split('\n')
+    .map((x) => x.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return 0;
+  let count = 0;
+  for (const line of lines) {
+    if (/^[-=]{3,}$/.test(line)) continue;
+    if (/^---\s*.+\s*---$/.test(line)) continue;
+    if (/^(sheet|工作表)\s*[:：]/i.test(line)) continue;
+    if (line.replace(/[|·•\-\s]/g, '').length < 2) continue;
+    count += 1;
+  }
+  return count;
+}
+
 function hashAssessmentInput(assessment) {
   const findings = Array.isArray(assessment.findings) ? assessment.findings : [];
   const stableFindings = findings
@@ -1975,41 +1992,48 @@ app.post('/api/assessments/precheck', requireAuth, (req, res) => {
   if (!hasPermission(req.user, settings, 'runAssessments')) {
     return res.status(403).json({ error: '无权执行评估输入预检查' });
   }
-  const policy = getAssessmentQualityPolicy(settings);
   const raw = req.body && typeof req.body.assessment === 'object' ? req.body.assessment : null;
   if (!raw) {
     return res.status(400).json({ error: 'assessment 不能为空' });
   }
-  const checked = validateAssessmentRecord(raw, 0, policy, settings);
-  if (!checked.ok) {
-    appendAudit({
-      action: 'assessments.precheck.reject',
-      actor: req.user.username,
-      detail: { reason: checked.error },
-    });
-    return res.status(400).json({ ok: false, error: checked.error });
+  const standardId = String(raw.standardId || '').trim();
+  const evidenceText = String(raw.evidenceText || '');
+  if (!standardId) {
+    return res.status(400).json({ error: 'standardId 不能为空' });
   }
-  const out = checked.value;
+  const controlsMap =
+    settings &&
+    settings.standardsLibrary &&
+    settings.standardsLibrary.controls &&
+    typeof settings.standardsLibrary.controls === 'object'
+      ? settings.standardsLibrary.controls
+      : {};
+  const standardControlCount = Array.isArray(controlsMap[standardId]) ? controlsMap[standardId].length : 0;
+  const parsedItemCount = countParsedEvidenceItems(evidenceText);
+  const matched = parsedItemCount === standardControlCount;
+  const message = matched
+    ? `调研条目数与标准条款数一致（${parsedItemCount}）`
+    : `调研条目数（${parsedItemCount}）与标准条款数（${standardControlCount}）不一致，请检查并更新调研文件后重试。`;
+
   appendAudit({
     action: 'assessments.precheck',
     actor: req.user.username,
     detail: {
-      assessmentId: out.id,
-      publishable: out.quality.publishable,
-      score: out.quality.score,
-      issueCount: out.quality.issues.length,
-      issues: out.quality.issues.slice(0, 8),
+      assessmentId: String(raw.id || ''),
+      standardId,
+      parsedItemCount,
+      standardControlCount,
+      matched,
     },
   });
   return res.json({
     ok: true,
-    assessmentId: out.id,
-    publishable: out.quality.publishable,
-    score: out.quality.score,
-    confidence: out.quality.confidence,
-    issues: out.quality.issues,
-    metrics: out.quality.metrics,
-    inputFingerprint: out.inputFingerprint,
+    assessmentId: String(raw.id || ''),
+    standardId,
+    parsedItemCount,
+    standardControlCount,
+    matched,
+    message,
   });
 });
 

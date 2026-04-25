@@ -269,22 +269,22 @@ export async function postAssessmentPrecheck(assessment: Assessment) {
   const data = (await res.json().catch(() => ({}))) as {
     ok?: boolean;
     error?: string;
-    publishable?: boolean;
-    score?: number;
-    confidence?: 'High' | 'Medium' | 'Low';
-    issues?: string[];
-    metrics?: Record<string, number>;
-    inputFingerprint?: string;
+    assessmentId?: string;
+    standardId?: string;
+    parsedItemCount?: number;
+    standardControlCount?: number;
+    matched?: boolean;
+    message?: string;
   };
   if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
   return data as {
     ok: true;
-    publishable: boolean;
-    score: number;
-    confidence: 'High' | 'Medium' | 'Low';
-    issues: string[];
-    metrics?: Record<string, number>;
-    inputFingerprint?: string;
+    assessmentId: string;
+    standardId: string;
+    parsedItemCount: number;
+    standardControlCount: number;
+    matched: boolean;
+    message: string;
   };
 }
 

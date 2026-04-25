@@ -550,8 +550,12 @@ export default function App() {
     const affectedAssessmentIds = new Set<string>();
     const itemRuns: DeepEvalTaskRecord['itemRuns'] = [];
     try {
-      const BATCH_SIZE = evalRuntimeConfig.concurrency;
-      const perItemTimeoutMs = evalRuntimeConfig.timeoutMs;
+      const BATCH_SIZE = 2;
+      // Deep evaluation prompt/output is heavier than regular auto-eval; use a wider per-item timeout window.
+      const perItemTimeoutMs = Math.min(
+        420000,
+        Math.max(180000, evalRuntimeConfig.timeoutMs + 120000)
+      );
       for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
         const batch = candidates.slice(i, i + BATCH_SIZE);
         const results = await Promise.all(
@@ -561,9 +565,13 @@ export default function App() {
             if (!control) {
               return { ok: false as const, item, durationMs: Date.now() - started, error: 'control_not_found' };
             }
-            try {
-              const next = (await Promise.race([
-                performGapAnalysis(control, item.evidence, { preferCloud: true, deepEval: true }),
+            const withTimeout = (budgetChars?: number) =>
+              Promise.race([
+                performGapAnalysis(control, item.evidence, {
+                  preferCloud: true,
+                  deepEval: true,
+                  evidenceBudgetChars: budgetChars,
+                }),
                 new Promise<never>((_, reject) =>
                   setTimeout(
                     () =>
@@ -577,15 +585,24 @@ export default function App() {
                     perItemTimeoutMs
                   )
                 ),
-              ])) as GapAnalysisResult;
-              return { ok: true as const, item, next, durationMs: Date.now() - started };
-            } catch (e) {
-              return {
-                ok: false as const,
-                item,
-                durationMs: Date.now() - started,
-                error: e instanceof Error ? e.message : String(e),
-              };
+              ]);
+            try {
+              const next = (await withTimeout(9000)) as GapAnalysisResult;
+              return { ok: true as const, item, next, durationMs: Date.now() - started, retried: false as const };
+            } catch (firstErr) {
+              try {
+                const retry = (await withTimeout(6000)) as GapAnalysisResult;
+                return { ok: true as const, item, next: retry, durationMs: Date.now() - started, retried: true as const };
+              } catch (e) {
+                const reasonFirst = firstErr instanceof Error ? firstErr.message : String(firstErr);
+                const reasonSecond = e instanceof Error ? e.message : String(e);
+                return {
+                  ok: false as const,
+                  item,
+                  durationMs: Date.now() - started,
+                  error: `${reasonSecond} | retry_after: ${reasonFirst}`,
+                };
+              }
             }
           })
         );
@@ -1287,6 +1304,41 @@ export default function App() {
                         <p className="text-xs font-semibold text-text-main/50 mb-4 uppercase tracking-wider">
                           {standardNameById[item.standardId || ''] || item.standardId}
                         </p>
+                        {canAssess && (
+                          <button
+                            type="button"
+                            className="mb-4 glass-card px-3 py-2 text-[11px] font-black uppercase tracking-widest hover:bg-white/70"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setActiveTab('assessments');
+                              setSelectedAssessmentId(item.id);
+                              if (!(item.evidenceText || '').trim()) {
+                                window.alert(
+                                  tx(
+                                    '该任务尚未填写调研证据，请先进入任务导入或填写调研内容。',
+                                    'This task has no evidence yet. Open it and add evidence first.'
+                                  )
+                                );
+                                return;
+                              }
+                              setAssessments((prev) =>
+                                prev.map((a) =>
+                                  a.id === item.id
+                                    ? {
+                                        ...a,
+                                        status: 'In Progress',
+                                        updatedAt: new Date().toISOString(),
+                                      }
+                                    : a
+                                )
+                              );
+                            }}
+                          >
+                            {item.status === 'Draft'
+                              ? tx('启动评估', 'Start Assessment')
+                              : tx('重新评估', 'Re-run Assessment')}
+                          </button>
+                        )}
                         <div className="mb-4 flex flex-wrap gap-2">
                           <span className="rounded-full border border-black/10 bg-white/70 px-2.5 py-1 text-[10px] font-bold text-text-main/70">
                             {t('labelCompany')}

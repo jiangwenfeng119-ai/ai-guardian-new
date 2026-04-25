@@ -671,10 +671,10 @@ function gapAnalysisFromModelText(
   if (trimmed.length > 0) {
     const diag = (diagnosticEvidence ?? evidenceTextForFallback).trim();
     return {
-      status: 'Non-Compliant',
-      analysis: `模型输出不是有效 JSON，无法写入结构化结论。模型原文摘录：\n${trimmed.slice(0, 1200)}${trimmed.length > 1200 ? '…' : ''}\n\n送入分析的证据摘录：\n${diag.slice(0, 1800)}${diag.length > 1800 ? '…' : ''}`,
+      status: 'Partial',
+      analysis: `分析失败：模型输出不是有效 JSON，无法写入结构化结论。模型原文摘录：\n${trimmed.slice(0, 1200)}${trimmed.length > 1200 ? '…' : ''}\n\n送入分析的证据摘录：\n${diag.slice(0, 1800)}${diag.length > 1800 ? '…' : ''}`,
       recommendation:
-        '请重试本次分析；若多次出现，请检查模型是否遵循「仅输出 JSON」要求，或尝试其它模型 / 降低 temperature。',
+        '请重试本次分析；若多次出现，请检查模型配置与超时参数，必要时更换模型后重跑。',
     };
   }
   return localKeywordFallback(control, evidenceTextForFallback);
@@ -724,10 +724,17 @@ function normalizeFindingResult(parsed: Record<string, unknown> | null): Partial
 export async function performGapAnalysis(
   control: Control,
   evidenceText: string,
-  options?: { preferCloud?: boolean; deepEval?: boolean }
+  options?: { preferCloud?: boolean; deepEval?: boolean; evidenceBudgetChars?: number }
 ): Promise<GapAnalysisResult> {
   const settings = getAiSettings();
-  const bundle = buildEvidenceExcerptForControl(control, evidenceText);
+  const budgetChars = Number(options?.evidenceBudgetChars);
+  const bundle = buildEvidenceExcerptForControl(control, evidenceText, {
+    budgetChars: Number.isFinite(budgetChars)
+      ? Math.min(48_000, Math.max(2_000, budgetChars))
+      : options?.deepEval
+        ? 9_000
+        : 6_000,
+  });
   const promptEvidenceBody = bundle.excerpt
     ? `${bundle.preamble}\n\n${bundle.excerpt}`.trim()
     : '(无证据文本)';
@@ -746,43 +753,31 @@ export async function performGapAnalysis(
     );
   }
 
-  const prompt = `你是一个专业的网络安全合规评估专家。
-请对比以下"合规要求项"与"检查结果/访谈记录"，进行差距分析。
+  const prompt = `你是安全合规评估助手。请根据给定证据判断控制项差距，并输出 JSON。
 
-合规要求项:
+控制项:
 ID: ${control.id}
 名称: ${control.name}
-详细要求: ${control.requirement}${
-    control.command?.trim()
-      ? `\n自动化核查参考（可结合证据判断是否已落实，勿仅凭命令字面推断合规）:\n${control.command.trim()}`
-      : ''
+要求: ${control.requirement}${
+    control.command?.trim() ? `\n参考命令:\n${control.command.trim()}` : ''
   }
 
-检查结果/访谈记录:
+证据:
 ${promptEvidenceBody}
 
-请按照以下 JSON 格式输出结果:
+输出格式（仅 JSON）:
 {
   "status": "Compliant" | "Partial" | "Non-Compliant" | "Not Applicable",
-  "analysis": "差距分析详细描述",
-  "recommendation": "整改建议"
+  "analysis": "简要分析（1-3 句）",
+  "recommendation": "可执行建议（1-3 句）"
 }
 
-【Evidence Quality Contract - 业务可用模式】
-1) 只能依据输入证据判断，不得虚构系统、配置、日志、人员、时间。
-2) 证据不完美但有部分事实时，优先给 Partial；仅在关键要求完全无证据或有明显反证时给 Non-Compliant。
-3) analysis 先写已确认事实，再写缺失信息/不确定点，最后写风险影响；如有不确定性请写“置信度：High/Medium/Low”。
-4) recommendation 必须可执行，至少包含动作 + 责任角色 + 建议时限；证据不足时第一条先写“补证动作”。
-5) 若输出 Compliant，必须给出至少 2 个事实依据；不足时降为 Partial。
-6) 若人工调研明确写了“Not Applicable/不适用”，应判定 Not Applicable，不要给整改动作。
-
-注意：只输出 JSON，不要其它说明文字。${
-    bundle.wasTruncated
-      ? '\n说明：上列为证据节选，未展示部分可能仍含与结论相关的信息；若节选不足以判断，请在 analysis 中明确写出「信息不足/未见反证」等限定语。'
-      : ''
-  }${
+要求:
+1) 仅基于证据，不要编造。
+2) 证据不足时优先给 Partial，并在 analysis 写明“证据不足”。
+3) 只返回 JSON。${
     options?.deepEval
-      ? '\n深度评估要求：请给出完整结构化输出，额外包含 rootCause、technicalDetails、recommendations（数组）、ownerTeam、targetDate、riskLevel。请在技术说明中写清关键技术点，在整改建议中给出可执行步骤。'
+      ? '\n深度评估模式：额外返回 rootCause、technicalDetails、recommendations(数组)、ownerTeam、targetDate、riskLevel。technicalDetails 不超过 180 字，recommendations 最多 3 条。'
       : ''
   }`;
 
