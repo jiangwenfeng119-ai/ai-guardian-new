@@ -1132,6 +1132,7 @@ export default function StandardsConfig({
         {catalogEntries.map(std => (
           <div 
             key={std.id}
+            title={String(std.description || tx('暂无说明', 'No description')).trim()}
             draggable
             onDragStart={() => {
               setDraggingStandardId(std.id);

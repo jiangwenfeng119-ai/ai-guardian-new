@@ -768,7 +768,14 @@ function countParsedEvidenceItems(evidenceText) {
       .replace(/\s+/g, '');
   const isResearchListSheet = (name) => {
     const n = normalizeSheetName(name);
-    return n === '调研清单' || n === 'researchlist' || n === 'research_checklist';
+    return (
+      n === '调研清单' ||
+      n === '标准检查清单' ||
+      n === 'researchlist' ||
+      n === 'research_checklist' ||
+      n === 'standardchecklist' ||
+      n === 'checklist'
+    );
   };
 
   let activeSheet = '';
@@ -786,6 +793,7 @@ function countParsedEvidenceItems(evidenceText) {
     if (/^[-=]{3,}$/.test(line)) continue;
     if (/^---\s*.+\s*---$/.test(line)) continue;
     if (/^(sheet|工作表)\s*[:：]/i.test(line)) continue;
+    if (/^(控制项id|检查项名称|合规要求|自动化核查命令|检查结果|合规结论)/i.test(line.replace(/\s+/g, ''))) continue;
     if (line.replace(/[|·•\-\s]/g, '').length < 2) continue;
     count += 1;
   }

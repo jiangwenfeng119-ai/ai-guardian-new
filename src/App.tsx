@@ -811,13 +811,28 @@ export default function App() {
   }, [dashboardDataVersion]);
 
   const filteredAssessments = useMemo(
-    () =>
-      assessments.filter((a) => {
+    () => {
+      const statusRank = (status: string) => {
+        if (status === 'In Progress') return 0;
+        if (status === 'Draft') return 1;
+        if (status === 'Completed') return 2;
+        return 3;
+      };
+      return assessments
+        .filter((a) => {
         const companyOk = assessmentCompanyFilter === 'all' || a.companyId === assessmentCompanyFilter;
         const projectOk = assessmentProjectFilter === 'all' || a.projectId === assessmentProjectFilter;
         const creatorOk = assessmentCreatorFilter === 'all' || (a.createdBy || '') === assessmentCreatorFilter;
         return companyOk && projectOk && creatorOk;
-      }),
+        })
+        .sort((a, b) => {
+          const rankDiff = statusRank(a.status) - statusRank(b.status);
+          if (rankDiff !== 0) return rankDiff;
+          const ta = Date.parse(String(a.updatedAt || a.createdAt || '')) || 0;
+          const tb = Date.parse(String(b.updatedAt || b.createdAt || '')) || 0;
+          return tb - ta;
+        });
+    },
     [assessments, assessmentCompanyFilter, assessmentProjectFilter, assessmentCreatorFilter]
   );
   const creatorOptions = useMemo(() => {

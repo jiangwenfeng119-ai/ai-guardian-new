@@ -96,6 +96,17 @@ function saveAnalysisCache(cache: Record<string, { findings: Finding[]; ts: numb
   }
 }
 
+function clearAnalysisCacheEntry(cacheKey: string) {
+  try {
+    const cache = loadAnalysisCache();
+    if (!cache[cacheKey]) return;
+    delete cache[cacheKey];
+    saveAnalysisCache(cache);
+  } catch {
+    // ignore
+  }
+}
+
 function loadExecSummaryCache(): Record<string, { text: string; ts: number }> {
   try {
     const raw = localStorage.getItem(EXEC_SUMMARY_CACHE_KEY);
@@ -562,6 +573,7 @@ export default function AssessmentFlow({
 
     const ac = new AbortController();
     registerAnalysisRun(id, ac);
+    const ABORTED_REASON = '__ANALYSIS_ABORTED__';
 
     let findingsSoFar = opts.clearFindings ? [] : [...assessment.findings];
     const ts = () => new Date().toISOString();
@@ -586,6 +598,14 @@ export default function AssessmentFlow({
         const batch = pendingControls.slice(i, i + BATCH_SIZE);
         const settled = await Promise.allSettled(
           batch.map(async (control) => {
+            if (ac.signal.aborted) throw new Error(ABORTED_REASON);
+            const abortPromise = new Promise<never>((_, reject) => {
+              if (ac.signal.aborted) {
+                reject(new Error(ABORTED_REASON));
+                return;
+              }
+              ac.signal.addEventListener('abort', () => reject(new Error(ABORTED_REASON)), { once: true });
+            });
             const result = (await Promise.race([
               performGapAnalysis(control, evidence),
               new Promise<never>((_, reject) =>
@@ -601,6 +621,7 @@ export default function AssessmentFlow({
                   timeoutMs
                 )
               ),
+              abortPromise,
             ])) as GapAnalysisResult;
             const status: Finding['status'] = result.status || 'Non-Compliant';
             const attentionState: Finding['attentionState'] =
@@ -619,12 +640,17 @@ export default function AssessmentFlow({
           })
         );
         if (ac.signal.aborted) break;
-        const batchFindings: Finding[] = settled.map((entry, idx) => {
-          if (entry.status === 'fulfilled') return entry.value;
-          const control = batch[idx];
+        const batchFindings: Finding[] = [];
+        settled.forEach((entry, idx) => {
+          if (entry.status === 'fulfilled') {
+            batchFindings.push(entry.value);
+            return;
+          }
           const reason = entry.reason instanceof Error ? entry.reason.message : String(entry.reason);
+          if (reason === ABORTED_REASON) return;
+          const control = batch[idx];
           const evidenceSnippet = evidence.length > 500 ? `${evidence.slice(0, 500)}…` : evidence;
-          return {
+          batchFindings.push({
             controlId: control.id,
             status: 'Partial' as const,
             attentionState: 'pending' as const,
@@ -637,7 +663,7 @@ export default function AssessmentFlow({
               locale === 'en-US'
                 ? 'Please rerun this assessment item after checking model connectivity and timeout settings.'
                 : '请检查模型联通性与超时配置后，重新运行该评估项。',
-          };
+          });
         });
         findingsSoFar = [...findingsSoFar, ...batchFindings];
         patch((prev) => ({
@@ -682,6 +708,12 @@ export default function AssessmentFlow({
 
   const handleStopAnalysis = () => {
     abortAssessmentAnalysis(assessment.id);
+    patch((prev) => ({
+      ...prev,
+      status: 'Draft',
+      evidenceText: (evidenceText.trim() || prev.evidenceText || '').trim(),
+      updatedAt: new Date().toISOString(),
+    }));
   };
 
   const handleExport = async (format: 'excel' | 'word' | 'pdf') => {
@@ -706,6 +738,16 @@ export default function AssessmentFlow({
       assessmentId: assessment.id,
       standardId: assessment.standardId,
     }).catch(() => {});
+    if (currentControls.length > 0 && assessment.findings.length >= currentControls.length) {
+      const completedInputFp = simpleHash(
+        JSON.stringify({
+          standardId: assessment.standardId,
+          evidence: (assessment.evidenceText || '').trim(),
+          controls: currentControls.map((c) => c.id),
+        })
+      );
+      clearAnalysisCacheEntry(completedInputFp);
+    }
   };
 
   const retryExecutiveSummary = async () => {
