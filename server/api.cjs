@@ -761,8 +761,28 @@ function countParsedEvidenceItems(evidenceText) {
     .map((x) => x.trim())
     .filter(Boolean);
   if (lines.length === 0) return 0;
+  const normalizeSheetName = (name) =>
+    String(name || '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, '');
+  const isResearchListSheet = (name) => {
+    const n = normalizeSheetName(name);
+    return n === '调研清单' || n === 'researchlist' || n === 'research_checklist';
+  };
+
+  let activeSheet = '';
+  let sawSheetHeader = false;
   let count = 0;
   for (const line of lines) {
+    const zhSheetHeader = line.match(/^---\s*工作表\s*:\s*(.+?)\s*---$/i);
+    const enSheetHeader = line.match(/^---\s*sheet\s*:\s*(.+?)\s*---$/i);
+    if (zhSheetHeader || enSheetHeader) {
+      sawSheetHeader = true;
+      activeSheet = String((zhSheetHeader || enSheetHeader)?.[1] || '').trim();
+      continue;
+    }
+    if (sawSheetHeader && !isResearchListSheet(activeSheet)) continue;
     if (/^[-=]{3,}$/.test(line)) continue;
     if (/^---\s*.+\s*---$/.test(line)) continue;
     if (/^(sheet|工作表)\s*[:：]/i.test(line)) continue;

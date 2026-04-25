@@ -154,11 +154,8 @@ export default function BugTracker({ onSessionExpired }: BugTrackerProps) {
                   </td>
                   <td className="py-3 pr-3">{b.reporterName || '—'}</td>
                   <td className="py-3 pr-3">
-                    <span className={cn('inline-flex mb-2 rounded-full border px-2 py-0.5 text-[10px] font-black uppercase tracking-widest', statusBadgeClass(b.status))}>
-                      {statusLabel[b.status]}
-                    </span>
                     <select
-                      className={cn('glass-input px-2 py-1 text-xs font-semibold border', statusBadgeClass(b.status))}
+                      className={cn('glass-input px-2 py-1 text-xs font-semibold border rounded-full min-w-[120px]', statusBadgeClass(b.status))}
                       value={b.status}
                       onChange={(e) => void updateStatus(b.id, e.target.value as 'submitted' | 'in_progress' | 'resolved')}
                     >
