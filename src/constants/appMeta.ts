@@ -17,6 +17,8 @@ export const RELEASE_NOTES: ReleaseNoteEntry[] = [
       'Docker：compose 增加 BACKUP_ALLOWED_ROOT 与 ./backups 卷示例，便于定时备份落盘到宿主机',
       '运维文档：public/docs 提供中英文运维一页；备份页链接随界面语言切换；开发/生产均以 UTF-8 显式返回正文，避免浏览器误判编码导致乱码',
       'PDF 导出修复：与 Word 一致在可用时带入聚合执行摘要（此前 PDF 路径未传入摘要）',
+      '仪表盘待关注项修复：在「分析输入指纹 inputFingerprint 未变」时服务端原样保留分析结果会覆盖客户端待关注状态；现改为将 PUT 中的 attentionState 按 controlId 合并进既有 findings，保存后状态可正确落库（他人反馈的「改状态不生效」）',
+      '评估自动保存：仅序列化并提交本人任务（ownAssessments），拉取支持 assessmentViewScope，与可见范围一致，降低误覆盖与无效 PUT',
       '仪表盘深度评估：按可见公司与筛选条件控制是否可启动深度评估，不满足时禁用按钮并展示双语范围提示（与 App 侧权限/筛选联动）',
       '依赖与工具链：新增 archiver、adm-zip、multer；Vite 增加运维文档中间件；settingsApi 增加备份下载/上传接口封装',
     ],
