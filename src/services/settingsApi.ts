@@ -235,8 +235,11 @@ export async function postStandardsSync(sync: ApiSyncSettings) {
   };
 }
 
-export async function fetchAssessments(opts?: { signal?: AbortSignal }) {
-  const res = await fetch('/api/assessments', { headers: { ...authHeaders() }, signal: opts?.signal });
+export async function fetchAssessments(opts?: { signal?: AbortSignal; scope?: 'mine' | 'visible' }) {
+  const q = new URLSearchParams();
+  if (opts?.scope) q.set('scope', opts.scope);
+  const url = `/api/assessments${q.toString() ? `?${q.toString()}` : ''}`;
+  const res = await fetch(url, { headers: { ...authHeaders() }, signal: opts?.signal });
   checkSession(res);
   if (!res.ok) throw new Error(await parseError(res));
   return res.json() as Promise<{ assessments: Assessment[] }>;
@@ -501,4 +504,40 @@ export async function postLegalRegulationsRegenerateSummary(body: {
   };
   if (!res.ok || data.ok === false) throw new Error(data.error || data.message || res.statusText);
   return data;
+}
+
+export async function downloadBackupZip(opts?: { signal?: AbortSignal }): Promise<{ blob: Blob; suggestedFilename: string }> {
+  const res = await fetch('/api/admin/backup/export', { headers: { ...authHeaders() }, signal: opts?.signal });
+  checkSession(res);
+  if (!res.ok) throw new Error(await parseError(res));
+  const cd = res.headers.get('Content-Disposition') || '';
+  let suggestedFilename = `ai-guardian-backup-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.zip`;
+  const star = /filename\*=UTF-8''([^;\s]+)/i.exec(cd);
+  if (star) {
+    try {
+      suggestedFilename = decodeURIComponent(star[1]);
+    } catch {
+      /* keep default */
+    }
+  } else {
+    const plain = /filename="([^"]+)"/i.exec(cd);
+    if (plain?.[1]) suggestedFilename = plain[1];
+  }
+  const blob = await res.blob();
+  return { blob, suggestedFilename };
+}
+
+export async function importBackupZip(file: File, opts?: { signal?: AbortSignal }) {
+  const fd = new FormData();
+  fd.append('file', file);
+  const res = await fetch('/api/admin/backup/import', {
+    method: 'POST',
+    headers: { ...authHeaders() },
+    body: fd,
+    signal: opts?.signal,
+  });
+  checkSession(res);
+  const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; message?: string };
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data as { ok?: boolean; message?: string; snapshotDir?: string };
 }

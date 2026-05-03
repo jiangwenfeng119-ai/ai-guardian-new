@@ -3,6 +3,7 @@ import * as XLSX from 'xlsx';
 import { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType } from 'docx';
 import { jsPDF } from 'jspdf';
 import { Finding, Control, Standard } from '../types';
+import { NOTO_SANS_SC_REGULAR_BASE64 } from '../constants/pdfFonts';
 
 export type DeepEvalTaskReport = {
   id: string;
@@ -15,6 +16,22 @@ export type DeepEvalTaskReport = {
   affectedAssessmentIds: string[];
   reportSummary?: string;
   error?: string;
+};
+
+const PDF_CHINESE_FONT_FILE = 'NotoSansSC-Regular.ttf';
+const PDF_CHINESE_FONT_FAMILY = 'NotoSansSC';
+
+const applyPdfChineseFont = (doc: jsPDF) => {
+  if (!NOTO_SANS_SC_REGULAR_BASE64) return;
+
+  try {
+    doc.addFileToVFS(PDF_CHINESE_FONT_FILE, NOTO_SANS_SC_REGULAR_BASE64);
+    doc.addFont(PDF_CHINESE_FONT_FILE, PDF_CHINESE_FONT_FAMILY, 'normal');
+    doc.setFont(PDF_CHINESE_FONT_FAMILY, 'normal');
+  } catch (error) {
+    // Keep export available even when font registration fails.
+    console.warn('Failed to register Chinese PDF font, fallback to default font.', error);
+  }
 };
 
 export const EXPORT_SERVICE = {
@@ -122,22 +139,54 @@ export const EXPORT_SERVICE = {
   },
 
   // Export to PDF
-  exportToPDF: (findings: Finding[], controls: Control[], standardName: string) => {
+  exportToPDF: (findings: Finding[], controls: Control[], standardName: string, summary: string) => {
     const doc = new jsPDF();
-    doc.setFontSize(20);
-    doc.text(`${standardName} Compliance Report`, 10, 20);
-    doc.setFontSize(12);
-    
-    let y = 30;
-    findings.forEach((f, i) => {
-      if (y > 270) {
-        doc.addPage();
-        y = 20;
-      }
-      doc.text(`${f.controlId}: ${f.status}`, 10, y);
-      y += 10;
+    applyPdfChineseFont(doc);
+    const pageHeight = 297;
+    const marginX = 10;
+    const textMaxWidth = 190;
+    let y = 16;
+
+    const ensureRoom = (need = 8) => {
+      if (y + need <= pageHeight - 12) return;
+      doc.addPage();
+      y = 16;
+    };
+    const writeBlock = (label: string, content: string, fontSize = 11, gap = 6) => {
+      ensureRoom(8);
+      doc.setFontSize(fontSize);
+      const text = label ? `${label}${content}` : content;
+      const lines = doc.splitTextToSize(text || '—', textMaxWidth);
+      lines.forEach((line: string) => {
+        ensureRoom(6);
+        doc.text(line, marginX, y);
+        y += 6;
+      });
+      y += gap;
+    };
+
+    doc.setFontSize(18);
+    doc.text(`${standardName} 安全合规评估报告`, marginX, y);
+    y += 10;
+
+    doc.setFontSize(14);
+    doc.text('执行摘要', marginX, y);
+    y += 7;
+    writeBlock('', summary || '—', 11, 8);
+
+    doc.setFontSize(14);
+    doc.text('评估详细记录', marginX, y);
+    y += 8;
+
+    findings.forEach((f) => {
+      const control = controls.find((c) => c.id === f.controlId);
+      doc.setFontSize(12);
+      writeBlock('', `${f.controlId}: ${control?.name || ''}`, 12, 2);
+      writeBlock('合规状态: ', f.status, 11, 2);
+      writeBlock('差距分析: ', f.analysis || '—', 10, 2);
+      writeBlock('整改建议: ', f.recommendation || '—', 10, 5);
     });
-    
+
     doc.save(`${standardName}_Assessment.pdf`);
   },
 
@@ -193,6 +242,7 @@ export const EXPORT_SERVICE = {
 
   exportDeepEvalTaskToPDF: (task: DeepEvalTaskReport) => {
     const doc = new jsPDF();
+    applyPdfChineseFont(doc);
     doc.setFontSize(16);
     doc.text(`Deep Evaluation Report: ${task.id}`, 10, 20);
     doc.setFontSize(11);

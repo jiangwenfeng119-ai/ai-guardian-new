@@ -4,6 +4,7 @@
  * Env: JWT_SECRET, API_PORT (8787), API_HOST (127.0.0.1), DATA_DIR,
  *      SERVE_DIST=1 to serve ../dist (Docker/production), optional ADMIN_TOKEN (legacy)
  *      OLLAMA_PROXY_TARGET=http://host.docker.internal:11434 — reverse proxy /ollama -> Ollama (Docker/跨域)
+ *      BACKUP_ALLOWED_ROOT=/backups — optional extra root for automated backup targetDir (must still be resolved under it)
  */
 const express = require('express');
 const fs = require('fs');
@@ -12,6 +13,9 @@ const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
+const archiver = require('archiver');
+const AdmZip = require('adm-zip');
+const multer = require('multer');
 
 require('dotenv').config({ path: path.join(__dirname, '..', '.env.local') });
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
@@ -171,7 +175,112 @@ const DEFAULT_SETTINGS = {
     enforcementMode: 'soft',
     hardIssueCodes: ['coverage_below_threshold', 'evidence_too_short'],
   },
+  /** 自动备份（仅服务端写盘；targetDir 需在 DATA_DIR 下或 BACKUP_ALLOWED_ROOT 下） */
+  backup: {
+    enabled: false,
+    intervalHours: 24,
+    targetDir: '',
+    maxFiles: 14,
+    lastRunAt: '',
+    lastError: '',
+  },
 };
+
+const BACKUP_SCHEMA_VERSION = 1;
+const BACKUP_IMPORT_REQUIRED = new Set(['settings.json', 'users.json', 'assessments.json']);
+const BACKUP_ZIP_NAMES = new Set([
+  'manifest.json',
+  'settings.json',
+  'users.json',
+  'assessments.json',
+  'bugs.json',
+  'audit.jsonl',
+  'legal-regulations-cache.json',
+  'legal-regulations-history.json',
+]);
+
+function getBackupSourceEntries() {
+  return [
+    { zipName: 'settings.json', abs: SETTINGS_PATH },
+    { zipName: 'users.json', abs: USERS_PATH },
+    { zipName: 'assessments.json', abs: ASSESSMENTS_PATH },
+    { zipName: 'bugs.json', abs: BUGS_PATH },
+    { zipName: 'audit.jsonl', abs: AUDIT_PATH },
+    { zipName: 'legal-regulations-cache.json', abs: LEGAL_REGULATIONS_CACHE_PATH },
+    { zipName: 'legal-regulations-history.json', abs: LEGAL_REGULATIONS_HISTORY_PATH },
+  ];
+}
+
+function assertSafeBackupTargetDir(dirRaw) {
+  const dir = String(dirRaw || '').trim();
+  if (!dir) throw new Error('备份目标目录为空');
+  const resolved = path.resolve(dir);
+  const dataRoot = path.resolve(DATA_DIR);
+  const extra = process.env.BACKUP_ALLOWED_ROOT ? path.resolve(process.env.BACKUP_ALLOWED_ROOT) : null;
+  const roots = extra ? [dataRoot, extra] : [dataRoot];
+  const ok = roots.some((root) => resolved === root || resolved.startsWith(root + path.sep));
+  if (!ok) {
+    throw new Error(
+      `备份目录必须在 DATA_DIR 内，或位于环境变量 BACKUP_ALLOWED_ROOT 指定目录下。DATA_DIR=${dataRoot}`
+    );
+  }
+  return resolved;
+}
+
+function augmentBackupArchive(archive) {
+  const files = [];
+  for (const { zipName, abs } of getBackupSourceEntries()) {
+    if (fs.existsSync(abs)) {
+      const buf = fs.readFileSync(abs);
+      const hash = crypto.createHash('sha256').update(buf).digest('hex');
+      files.push({ name: zipName, sha256: hash, size: buf.length });
+      archive.append(buf, { name: zipName });
+    } else {
+      files.push({ name: zipName, sha256: '', size: 0, missing: true });
+    }
+  }
+  const manifest = {
+    schemaVersion: BACKUP_SCHEMA_VERSION,
+    app: 'AI Guardian',
+    exportedAt: new Date().toISOString(),
+    dataDir: DATA_DIR,
+    files,
+  };
+  archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
+}
+
+function writeBackupZipToFile(destAbs) {
+  return new Promise((resolve, reject) => {
+    const output = fs.createWriteStream(destAbs);
+    const archive = archiver('zip', { zlib: { level: 6 } });
+    output.on('error', reject);
+    archive.on('error', reject);
+    output.on('close', () => resolve());
+    archive.pipe(output);
+    augmentBackupArchive(archive);
+    archive.finalize().catch(reject);
+  });
+}
+
+function pruneOldBackups(targetDir, prefix, maxFiles) {
+  const names = fs
+    .readdirSync(targetDir, { withFileTypes: true })
+    .filter((d) => d.isFile() && d.name.startsWith(prefix) && d.name.endsWith('.zip'))
+    .map((d) => ({ name: d.name, t: fs.statSync(path.join(targetDir, d.name)).mtimeMs }))
+    .sort((a, b) => b.t - a.t);
+  for (let i = maxFiles; i < names.length; i += 1) {
+    try {
+      fs.unlinkSync(path.join(targetDir, names[i].name));
+    } catch (e) {
+      console.error('[ai-guardian backup] prune failed', e);
+    }
+  }
+}
+
+const backupUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: Math.min(1024 * 1024 * 1024, Number(process.env.BACKUP_IMPORT_MAX_BYTES || 1024 * 1024 * 1024)) },
+});
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -219,6 +328,7 @@ function readSettings() {
         ...DEFAULT_SETTINGS.standardsLibrary,
         ...((parsed && parsed.standardsLibrary) || {}),
       },
+      backup: { ...DEFAULT_SETTINGS.backup, ...((parsed && parsed.backup) || {}) },
     };
   } catch (e) {
     console.error('readSettings failed', e);
@@ -755,7 +865,7 @@ function calculateCoverageRatio(assessment, settings) {
   };
 }
 
-function countParsedEvidenceItems(evidenceText) {
+function countParsedEvidenceItems(evidenceText, standardControlIds = []) {
   const lines = String(evidenceText || '')
     .split('\n')
     .map((x) => x.trim())
@@ -771,22 +881,26 @@ function countParsedEvidenceItems(evidenceText) {
     return (
       n === '调研清单' ||
       n === '标准检查清单' ||
+      n.includes('清单') ||
+      n.includes('体检') ||
+      n.includes('检查') ||
       n === 'researchlist' ||
       n === 'research_checklist' ||
       n === 'standardchecklist' ||
       n === 'checklist'
     );
   };
-  const looksLikeControlId = (value) => {
-    const v = String(value || '').trim();
-    if (!v) return false;
-    // Common control id forms: 1.1.1 / A.1.2 / AC-01 / CTRL_001
-    return (
-      /^\d+(?:\.\d+)+$/.test(v) ||
-      /^[A-Za-z]\d*(?:\.\d+)+$/.test(v) ||
-      /^[A-Za-z]+[-_]\d+(?:[-_.]\d+)*$/i.test(v)
-    );
-  };
+  const normalizeControlId = (value) =>
+    String(value || '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, '');
+  const controlIdSet = new Set(
+    (Array.isArray(standardControlIds) ? standardControlIds : [])
+      .map((x) => normalizeControlId(x))
+      .filter(Boolean)
+  );
+  const countedIds = new Set();
 
   let activeSheet = '';
   let sawSheetHeader = false;
@@ -799,24 +913,27 @@ function countParsedEvidenceItems(evidenceText) {
       activeSheet = String((zhSheetHeader || enSheetHeader)?.[1] || '').trim();
       continue;
     }
-    if (sawSheetHeader && !isResearchListSheet(activeSheet)) continue;
+    // Some uploads use custom sheet names (e.g. IT安全健康体检清单).
+    // If controlIdSet exists, still try to parse rows by control ID even on unknown sheet names.
+    if (sawSheetHeader && !isResearchListSheet(activeSheet) && controlIdSet.size === 0) continue;
     if (/^[-=]{3,}$/.test(line)) continue;
     if (/^---\s*.+\s*---$/.test(line)) continue;
     if (/^(sheet|工作表)\s*[:：]/i.test(line)) continue;
     if (/^(控制项id|检查项名称|合规要求|自动化核查命令|检查结果|合规结论)/i.test(line.replace(/\s+/g, ''))) continue;
     if (line.replace(/[|·•\-\s]/g, '').length < 2) continue;
     const cols = line.split('|').map((x) => x.trim()).filter(Boolean);
-    if (cols.length > 0) {
-      const c0 = cols[0];
-      if (
-        /^(控制项id|id|检查项名称|名称|说明|备注)$/i.test(c0.replace(/\s+/g, '')) ||
-        /^标准检查清单$/i.test(c0)
-      ) {
-        continue;
-      }
-      // In checklist exports, true data rows should carry a control id in the first column.
-      if (!looksLikeControlId(c0)) continue;
+    const c0 = cols.length > 0 ? cols[0] : '';
+    if (
+      /^(控制项id|id|检查项名称|名称|说明|备注)$/i.test(c0.replace(/\s+/g, '')) ||
+      /^标准检查清单$/i.test(c0)
+    ) {
+      continue;
     }
+    const normalizedId = normalizeControlId(c0);
+    if (!normalizedId) continue;
+    if (controlIdSet.size > 0 && !controlIdSet.has(normalizedId)) continue;
+    if (countedIds.has(normalizedId)) continue;
+    countedIds.add(normalizedId);
     count += 1;
   }
   return count;
@@ -1911,6 +2028,102 @@ if (OLLAMA_PROXY_TARGET) {
 
 app.use(express.json({ limit: '2mb' }));
 
+app.get('/api/admin/backup/export', requireAuth, async (req, res) => {
+  if (req.user.role !== 'SuperAdmin') {
+    return res.status(403).json({ error: '仅超级管理员可导出备份' });
+  }
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const filename = `ai-guardian-backup-${ts}.zip`;
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+  const archive = archiver('zip', { zlib: { level: 6 } });
+  archive.on('error', (err) => {
+    console.error('[ai-guardian backup] export', err);
+    if (!res.headersSent) res.status(500).json({ error: String(err.message || err) });
+  });
+  archive.pipe(res);
+  augmentBackupArchive(archive);
+  try {
+    await archive.finalize();
+    appendAudit({ action: 'backup.export', actor: req.user.username, detail: { filename } });
+  } catch (e) {
+    console.error(e);
+  }
+});
+
+app.post('/api/admin/backup/import', requireAuth, backupUpload.single('file'), (req, res) => {
+  if (req.user.role !== 'SuperAdmin') {
+    return res.status(403).json({ error: '仅超级管理员可导入备份' });
+  }
+  if (!req.file || !req.file.buffer) {
+    return res.status(400).json({ error: '请上传 .zip 备份文件（字段名 file）' });
+  }
+  try {
+    const zip = new AdmZip(req.file.buffer);
+    const manEntry = zip.getEntry('manifest.json');
+    if (!manEntry) {
+      return res.status(400).json({ error: 'zip 内缺少 manifest.json' });
+    }
+    const manifest = JSON.parse(manEntry.getData().toString('utf8'));
+    if (!manifest || typeof manifest.schemaVersion !== 'number') {
+      return res.status(400).json({ error: 'manifest.json 无效' });
+    }
+    if (manifest.schemaVersion > BACKUP_SCHEMA_VERSION) {
+      return res.status(400).json({ error: '备份包版本高于当前系统，请先升级应用' });
+    }
+    const byName = new Map((Array.isArray(manifest.files) ? manifest.files : []).map((f) => [String(f.name || ''), f]));
+    for (const name of BACKUP_IMPORT_REQUIRED) {
+      const ent = zip.getEntry(name);
+      const meta = byName.get(name);
+      if (!ent || ent.isDirectory || (meta && meta.missing)) {
+        return res.status(400).json({ error: `备份包缺少必要文件: ${name}` });
+      }
+      const data = ent.getData();
+      const h = crypto.createHash('sha256').update(data).digest('hex');
+      if (meta && meta.sha256 && meta.sha256 !== h) {
+        return res.status(400).json({ error: `SHA256 校验失败: ${name}` });
+      }
+    }
+    const snap = path.join(DATA_DIR, `.pre-import-${Date.now()}`);
+    fs.mkdirSync(snap, { recursive: true });
+    for (const { zipName, abs } of getBackupSourceEntries()) {
+      if (fs.existsSync(abs)) {
+        fs.writeFileSync(path.join(snap, zipName), fs.readFileSync(abs));
+      }
+    }
+    for (const { zipName, abs } of getBackupSourceEntries()) {
+      const ent = zip.getEntry(zipName);
+      if (!ent || ent.isDirectory) {
+        if (BACKUP_IMPORT_REQUIRED.has(zipName)) {
+          return res.status(500).json({ error: `内部错误：缺少 ${zipName}` });
+        }
+        continue;
+      }
+      const data = ent.getData();
+      const meta = byName.get(zipName);
+      if (meta && meta.sha256 && !meta.missing) {
+        const h = crypto.createHash('sha256').update(data).digest('hex');
+        if (meta.sha256 !== h) {
+          return res.status(400).json({ error: `SHA256 校验失败: ${zipName}` });
+        }
+      }
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, data);
+    }
+    appendAudit({
+      action: 'backup.import',
+      actor: req.user.username,
+      detail: { snapshotDir: snap, exportedAt: manifest.exportedAt || null },
+    });
+    res.json({ ok: true, snapshotDir: snap, message: '导入完成。若 JWT_SECRET 与备份时不一致，所有用户需重新登录。' });
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    console.error('[ai-guardian backup] import', e);
+    appendAudit({ action: 'backup.import.error', actor: req.user.username, detail: { message: msg } });
+    res.status(400).json({ error: msg });
+  }
+});
+
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
@@ -2033,7 +2246,25 @@ app.get('/api/assessments', requireAuth, (req, res) => {
     return res.status(403).json({ error: '无权查看评估任务' });
   }
   const store = readAssessmentsStore();
-  const list = Array.isArray(store.byUser[req.user.id]) ? store.byUser[req.user.id] : [];
+  const scope = String(req.query.scope || 'mine').trim().toLowerCase();
+  const mine = Array.isArray(store.byUser[req.user.id]) ? store.byUser[req.user.id] : [];
+  const visibleCompanyIds = Array.isArray(req.user.visibleCompanyIds) ? req.user.visibleCompanyIds : [];
+  const visibleProjectIds = Array.isArray(req.user.visibleProjectIds) ? req.user.visibleProjectIds : [];
+  const hasCompanyScope = visibleCompanyIds.length > 0;
+  const hasProjectScope = visibleProjectIds.length > 0;
+  const inScope = (a) => {
+    const companyId = String(a?.companyId || '');
+    const projectId = String(a?.projectId || '');
+    if (hasCompanyScope && companyId && !visibleCompanyIds.includes(companyId)) return false;
+    if (hasProjectScope && projectId && !visibleProjectIds.includes(projectId)) return false;
+    return true;
+  };
+  const list =
+    scope === 'visible'
+      ? Object.values(store.byUser || {})
+          .flatMap((arr) => (Array.isArray(arr) ? arr : []))
+          .filter(inScope)
+      : mine;
   res.json({ assessments: list });
 });
 
@@ -2058,8 +2289,12 @@ app.post('/api/assessments/precheck', requireAuth, (req, res) => {
     typeof settings.standardsLibrary.controls === 'object'
       ? settings.standardsLibrary.controls
       : {};
-  const standardControlCount = Array.isArray(controlsMap[standardId]) ? controlsMap[standardId].length : 0;
-  const parsedItemCount = countParsedEvidenceItems(evidenceText);
+  const controlList = Array.isArray(controlsMap[standardId]) ? controlsMap[standardId] : [];
+  const standardControlCount = controlList.length;
+  const parsedItemCount = countParsedEvidenceItems(
+    evidenceText,
+    controlList.map((c) => String(c && c.id ? c.id : ''))
+  );
   const matched = parsedItemCount === standardControlCount;
   const message = matched
     ? `调研条目数与标准条款数一致（${parsedItemCount}）`
@@ -2140,9 +2375,25 @@ app.put('/api/assessments', requireAuth, (req, res) => {
     const prev = prevById.get(item.id);
     const prevFingerprint = String(prev && prev.inputFingerprint ? prev.inputFingerprint : '');
     if (prev && prevFingerprint && prevFingerprint === item.inputFingerprint && Array.isArray(prev.findings) && prev.findings.length > 0) {
+      // Fingerprint matches — preserve server analysis results, but merge client-side
+      // attentionState changes so they survive PUT (PUT sends the full findings array
+      // which may carry newer attentionState values from Dashboard).
+      const nextFindings = Array.isArray(item.findings) ? item.findings : [];
+      const incomingAttention = new Map(
+        nextFindings
+          .filter((f) => f && typeof f === 'object' && f.controlId)
+          .map((f) => [String(f.controlId), f.attentionState])
+      );
+      const mergedFindings = prev.findings.map((pf) => {
+        const incomingAttentionState = incomingAttention.get(String(pf?.controlId || ''));
+        if (incomingAttentionState !== undefined) {
+          return { ...pf, attentionState: incomingAttentionState || undefined };
+        }
+        return pf;
+      });
       return {
         ...item,
-        findings: prev.findings,
+        findings: mergedFindings,
         quality: prev.quality || item.quality,
         status: prev.status || item.status,
       };
@@ -2169,6 +2420,35 @@ app.put('/api/assessments', requireAuth, (req, res) => {
   writeAssessmentsStore(store);
   const publishableCount = saved.filter((x) => x?.quality?.publishable).length;
   const draftByGate = saved.filter((x) => x?.status === 'Draft' && Array.isArray(x?.quality?.issues) && x.quality.issues.length > 0).length;
+  const performanceRows = saved.map((item) => {
+    const createdMs = Date.parse(String(item?.createdAt || ''));
+    const updatedMs = Date.parse(String(item?.updatedAt || ''));
+    const totalDurationMs =
+      Number.isFinite(createdMs) && Number.isFinite(updatedMs) && updatedMs >= createdMs
+        ? updatedMs - createdMs
+        : null;
+    const findingCount = Array.isArray(item?.findings) ? item.findings.length : 0;
+    const avgDurationPerFindingMs =
+      totalDurationMs !== null && findingCount > 0 ? Math.round(totalDurationMs / findingCount) : null;
+    return {
+      assessmentId: String(item?.id || ''),
+      status: String(item?.status || ''),
+      companyId: String(item?.companyId || ''),
+      projectId: String(item?.projectId || ''),
+      findingCount,
+      totalDurationMs,
+      avgDurationPerFindingMs,
+    };
+  });
+  const withDuration = performanceRows.filter((x) => Number.isFinite(x.totalDurationMs));
+  const totalDurationMs = withDuration.reduce((acc, x) => acc + Number(x.totalDurationMs || 0), 0);
+  const totalFindings = performanceRows.reduce((acc, x) => acc + Number(x.findingCount || 0), 0);
+  const overallAvgDurationPerFindingMs = totalFindings > 0 ? Math.round(totalDurationMs / totalFindings) : null;
+  const taskAvgMsList = withDuration
+    .map((x) => (Number.isFinite(x.avgDurationPerFindingMs) ? Number(x.avgDurationPerFindingMs) : null))
+    .filter((v) => v !== null);
+  const avgTaskDurationPerFindingMs =
+    taskAvgMsList.length > 0 ? Math.round(taskAvgMsList.reduce((acc, v) => acc + v, 0) / taskAvgMsList.length) : null;
   appendAudit({
     action: 'assessments.save',
     actor: req.user.username,
@@ -2177,6 +2457,15 @@ app.put('/api/assessments', requireAuth, (req, res) => {
       publishableCount,
       draftByGate,
       issueDistribution,
+      performance: {
+        taskCount: saved.length,
+        validDurationTaskCount: withDuration.length,
+        totalDurationMs,
+        totalFindings,
+        overallAvgDurationPerFindingMs,
+        avgTaskDurationPerFindingMs,
+        perAssessment: performanceRows.slice(0, 120),
+      },
     },
   });
   res.json({
@@ -2533,6 +2822,7 @@ app.put('/api/settings', requireAuth, (req, res) => {
       baseInfo: current.baseInfo,
       standardsLibrary: current.standardsLibrary,
       permissions: current.permissions,
+      backup: current.backup || DEFAULT_SETTINGS.backup,
     };
     if (body.locale != null) {
       const locale = String(body.locale).trim();
@@ -2570,12 +2860,58 @@ app.put('/api/settings', requireAuth, (req, res) => {
           : current.standardsLibrary?.controls || {};
       next.standardsLibrary = { catalogEntries, controls };
     }
+    if (body.backup != null) {
+      if (req.user.role !== 'SuperAdmin') {
+        return res.status(403).json({ error: '仅超级管理员可修改自动备份设置' });
+      }
+      const b = body.backup && typeof body.backup === 'object' ? body.backup : {};
+      const intervalHours = Math.min(168, Math.max(1, Number(b.intervalHours) || 24));
+      const maxFiles = Math.min(500, Math.max(1, Number(b.maxFiles) || 14));
+      const targetDir = String(b.targetDir || '').trim();
+      next.backup = {
+        ...(current.backup || DEFAULT_SETTINGS.backup),
+        enabled: !!b.enabled,
+        intervalHours,
+        maxFiles,
+        targetDir,
+        lastRunAt: String((current.backup && current.backup.lastRunAt) || ''),
+        lastError: String((current.backup && current.backup.lastError) || ''),
+      };
+      if (next.backup.enabled && targetDir) {
+        try {
+          assertSafeBackupTargetDir(targetDir);
+        } catch (e) {
+          return res.status(400).json({ error: e && e.message ? e.message : String(e) });
+        }
+      }
+    }
 
     const saved = writeSettings(next);
+    let autoGrantedCompanyIds = [];
+    if (body.baseInfo != null) {
+      const data = readUsers();
+      const target = data.users.find((u) => u.id === req.user.id);
+      const companies = Array.isArray(saved?.baseInfo?.companies) ? saved.baseInfo.companies : [];
+      const allCompanyIds = companies
+        .map((c) => String(c && c.id ? c.id : '').trim())
+        .filter(Boolean);
+      if (target) {
+        const currentVisible = Array.isArray(target.visibleCompanyIds)
+          ? target.visibleCompanyIds.map((id) => String(id).trim()).filter(Boolean)
+          : [];
+        const merged = Array.from(new Set([...currentVisible, ...allCompanyIds]));
+        autoGrantedCompanyIds = merged.filter((id) => !currentVisible.includes(id));
+        target.visibleCompanyIds = merged;
+        writeUsers(data);
+      }
+    }
     appendAudit({
       action: 'settings.save',
       actor: req.user.username,
-      detail: { keys: Object.keys(body) },
+      detail: {
+        keys: Object.keys(body),
+        autoGrantedCompanyIds,
+      },
     });
     if (body.standardsLibrary != null || body.sync != null) {
       appendAudit({
@@ -3522,6 +3858,18 @@ app.post('/api/standards/sync', requireAuth, async (req, res) => {
 });
 
 if (SERVE_DIST) {
+  /** 显式 UTF-8；zh-CN / en-US 分文件，与界面语言一致 */
+  const sendBackupOperatorDoc = (res, filename) => {
+    const docPath = path.join(DIST_DIR, 'docs', filename);
+    if (!fs.existsSync(docPath)) {
+      return res.status(404).type('text/plain; charset=utf-8').send('Not found');
+    }
+    res.type('text/plain; charset=utf-8');
+    res.send(fs.readFileSync(docPath, 'utf8'));
+  };
+  app.get('/docs/BACKUP_OPERATOR.md', (_req, res) => sendBackupOperatorDoc(res, 'BACKUP_OPERATOR.zh-CN.md'));
+  app.get('/docs/BACKUP_OPERATOR.zh-CN.md', (_req, res) => sendBackupOperatorDoc(res, 'BACKUP_OPERATOR.zh-CN.md'));
+  app.get('/docs/BACKUP_OPERATOR.en-US.md', (_req, res) => sendBackupOperatorDoc(res, 'BACKUP_OPERATOR.en-US.md'));
   app.use(express.static(DIST_DIR));
   app.use((req, res, next) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -3536,6 +3884,78 @@ if (SERVE_DIST) {
   });
 }
 
+let autoBackupInterval = null;
+
+function maybeRunScheduledBackup() {
+  let s;
+  try {
+    s = readSettings();
+  } catch {
+    return;
+  }
+  const cfg = s.backup || DEFAULT_SETTINGS.backup;
+  if (!cfg.enabled) return;
+  const intervalMs = Math.max(3600000, Number(cfg.intervalHours || 24) * 3600000);
+  const last = cfg.lastRunAt ? Date.parse(String(cfg.lastRunAt)) : 0;
+  if (Number.isFinite(last) && last > 0 && Date.now() - last < intervalMs) return;
+  const rawT = String(cfg.targetDir || '').trim();
+  let targetBase;
+  try {
+    targetBase = rawT ? assertSafeBackupTargetDir(rawT) : assertSafeBackupTargetDir(path.join(DATA_DIR, 'auto-backups'));
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    console.error('[ai-guardian backup] auto target', e);
+    try {
+      const cur = readSettings();
+      writeSettings({
+        ...cur,
+        backup: { ...(cur.backup || DEFAULT_SETTINGS.backup), lastError: msg },
+      });
+    } catch (_) {}
+    return;
+  }
+  fs.mkdirSync(targetBase, { recursive: true });
+  const fname = `ai-guardian-auto-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.zip`;
+  const dest = path.join(targetBase, fname);
+  writeBackupZipToFile(dest)
+    .then(() => {
+      pruneOldBackups(targetBase, 'ai-guardian-auto-', Math.max(1, Number(cfg.maxFiles) || 14));
+      const cur = readSettings();
+      writeSettings({
+        ...cur,
+        backup: {
+          ...(cur.backup || DEFAULT_SETTINGS.backup),
+          lastRunAt: new Date().toISOString(),
+          lastError: '',
+        },
+      });
+      appendAudit({ action: 'backup.auto.ok', actor: 'system', detail: { path: dest } });
+    })
+    .catch((e) => {
+      const msg = e && e.message ? e.message : String(e);
+      console.error('[ai-guardian backup] auto', e);
+      try {
+        const cur = readSettings();
+        writeSettings({
+          ...cur,
+          backup: { ...(cur.backup || DEFAULT_SETTINGS.backup), lastError: msg },
+        });
+      } catch (_) {}
+      appendAudit({ action: 'backup.auto.error', actor: 'system', detail: { message: msg } });
+    });
+}
+
+function startAutoBackupScheduler() {
+  if (autoBackupInterval) clearInterval(autoBackupInterval);
+  autoBackupInterval = setInterval(() => {
+    try {
+      maybeRunScheduledBackup();
+    } catch (e) {
+      console.error(e);
+    }
+  }, 60_000);
+}
+
 const server = app.listen(API_PORT, API_HOST, () => {
   const hostLabel = API_HOST === '0.0.0.0' ? 'all interfaces' : API_HOST;
   console.log(`[ai-guardian api] listening on ${hostLabel}:${API_PORT}`);
@@ -3543,9 +3963,14 @@ const server = app.listen(API_PORT, API_HOST, () => {
     console.log(`[ai-guardian api] serving static from ${DIST_DIR}`);
   }
   console.log(`[ai-guardian api] JWT auth enabled (set JWT_SECRET in production)`);
+  startAutoBackupScheduler();
 });
 
 function shutdown() {
+  if (autoBackupInterval) {
+    clearInterval(autoBackupInterval);
+    autoBackupInterval = null;
+  }
   server.close(() => process.exit(0));
 }
 process.on('SIGINT', shutdown);

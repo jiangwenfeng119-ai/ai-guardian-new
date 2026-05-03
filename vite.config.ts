@@ -1,6 +1,7 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
+import fs from 'node:fs';
 import http from 'node:http';
 import {spawn, type ChildProcess} from 'child_process';
 import {fileURLToPath} from 'url';
@@ -8,28 +9,80 @@ import {defineConfig, loadEnv, type Plugin} from 'vite';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-/** 必须与前端首屏请求一致：只认 /api/auth/status，避免 8787 被其它程序占用时误判为“已就绪” */
-function apiAuthStatusReachable(timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const req = http.get('http://127.0.0.1:8787/api/auth/status', (res) => {
-      res.resume();
-      resolve(res.statusCode === 200);
+/** 与 Vite 代理、本地 API 探测一致；默认 8787，本地与 Docker 生产并存时请在 .env.local 设 API_PORT=8788 */
+function createApiAuthStatusReachable(apiPort: number) {
+  return function apiAuthStatusReachable(timeoutMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const req = http.get(`http://127.0.0.1:${apiPort}/api/auth/status`, (res) => {
+        res.resume();
+        resolve(res.statusCode === 200);
+      });
+      req.on('error', () => resolve(false));
+      req.setTimeout(timeoutMs, () => {
+        req.destroy();
+        resolve(false);
+      });
     });
-    req.on('error', () => resolve(false));
-    req.setTimeout(timeoutMs, () => {
-      req.destroy();
-      resolve(false);
-    });
-  });
+  };
 }
 
 function sleep(ms: number) {
   return new Promise<void>((r) => setTimeout(r, ms));
 }
 
-/** 开发时：在 Vite 挂好代理之前启动/探测 API（8787），避免首屏请求 /api 时后端未就绪。dev:all 设 AI_GUARDIAN_SKIP_API=1 */
-function startLocalApiPlugin(): Plugin {
+/** 开发 / preview：对运维 md 显式 charset=utf-8；中英文分文件 */
+function backupOperatorDocUtf8Plugin(): Plugin {
+  const DOC_MAP: Record<string, string> = {
+    '/docs/BACKUP_OPERATOR.md': 'BACKUP_OPERATOR.zh-CN.md',
+    '/docs/BACKUP_OPERATOR.zh-CN.md': 'BACKUP_OPERATOR.zh-CN.md',
+    '/docs/BACKUP_OPERATOR.en-US.md': 'BACKUP_OPERATOR.en-US.md',
+  };
+  const sendDoc = (reqUrl: string | undefined, base: string, res: import('http').ServerResponse, next: () => void) => {
+    const pathname = (reqUrl || '').split('?')[0] || '';
+    const baseNorm = base.endsWith('/') ? base.slice(0, -1) : base;
+    let rel = pathname;
+    if (baseNorm && baseNorm !== '/' && pathname.startsWith(baseNorm)) {
+      rel = pathname.slice(baseNorm.length) || '/';
+      if (!rel.startsWith('/')) rel = `/${rel}`;
+    }
+    const diskName = DOC_MAP[rel];
+    if (!diskName) {
+      next();
+      return;
+    }
+    const file = path.join(__dirname, 'public/docs', diskName);
+    if (!fs.existsSync(file)) {
+      next();
+      return;
+    }
+    try {
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.end(fs.readFileSync(file, 'utf8'));
+    } catch {
+      next();
+    }
+  };
+  return {
+    name: 'backup-operator-doc-utf8',
+    enforce: 'pre',
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        sendDoc(req.url, server.config.base, res, next);
+      });
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use((req, res, next) => {
+        sendDoc(req.url, server.config.base, res, next);
+      });
+    },
+  };
+}
+
+/** 开发时：在 Vite 挂好代理之前启动/探测本地 API，避免首屏请求 /api 时后端未就绪。dev:all 设 AI_GUARDIAN_SKIP_API=1 */
+function startLocalApiPlugin(apiPort: number): Plugin {
   let child: ChildProcess | null = null;
+  const apiAuthStatusReachable = createApiAuthStatusReachable(apiPort);
   return {
     name: 'ai-guardian-local-api',
     apply: 'serve',
@@ -48,14 +101,14 @@ function startLocalApiPlugin(): Plugin {
 
       let alreadyUp = await apiAuthStatusReachable(800);
       if (alreadyUp) {
-        console.log('[ai-guardian] Local API (ai-guardian) already on 8787 — reusing, skip spawn.');
+        console.log(`[ai-guardian] Local API already on ${apiPort} — reusing, skip spawn.`);
         return;
       }
 
       child = spawn(process.execPath, [apiEntry], {
         cwd: __dirname,
         stdio: 'inherit',
-        env: {...process.env},
+        env: {...process.env, API_PORT: String(apiPort)},
       });
       child.on('error', (err) => {
         console.error('[ai-guardian] 无法启动本地 API:', err.message);
@@ -63,7 +116,7 @@ function startLocalApiPlugin(): Plugin {
       child.on('exit', (code, signal) => {
         if (code !== 0 && code !== null) {
           console.error(
-            `[ai-guardian] server/api.cjs exited (${code}). If port 8787 is in use, stop the other process or set API_PORT in .env.local`
+            `[ai-guardian] server/api.cjs exited (${code}). If port ${apiPort} is in use, stop the other process or set API_PORT in .env.local`
           );
         }
       });
@@ -71,13 +124,13 @@ function startLocalApiPlugin(): Plugin {
       const deadline = Date.now() + 25_000;
       while (Date.now() < deadline) {
         if (await apiAuthStatusReachable(600)) {
-          console.log('[ai-guardian] Local API ready on 8787 (/api/auth/status OK).');
+          console.log(`[ai-guardian] Local API ready on ${apiPort} (/api/auth/status OK).`);
           return;
         }
         await sleep(200);
       }
       console.error(
-        '[ai-guardian] Timed out waiting for http://127.0.0.1:8787/api/auth/status — check server/api.cjs or free port 8787'
+        `[ai-guardian] Timed out waiting for http://127.0.0.1:${apiPort}/api/auth/status — check server/api.cjs or free port ${apiPort}`
       );
     },
   };
@@ -85,21 +138,25 @@ function startLocalApiPlugin(): Plugin {
 
 export default defineConfig(({mode}) => {
   const env = loadEnv(mode, '.', '');
+  /** 与 Docker 生产（8787）并存时：.env.local 设 API_PORT=8788，或由 scripts/dev-all.cjs 注入 */
+  const apiPort = Number(env.API_PORT || process.env.API_PORT || 8787);
+  /** 本地测试前端端口，默认 3000 */
+  const devPort = Number(env.VITE_DEV_PORT || process.env.VITE_DEV_PORT || 3000);
+
   return {
-    plugins: [startLocalApiPlugin(), react(), tailwindcss()],
+    plugins: [backupOperatorDocUtf8Plugin(), startLocalApiPlugin(apiPort), react(), tailwindcss()],
     server: {
-      /** 默认 5173，少与 3000 系其它服务冲突；被占用时 Vite 会自动换端口，请看终端里 Local: 行 */
-      port: 5173,
+      port: devPort,
       strictPort: false,
       host: true,
       proxy: {
         '/api': {
-          target: 'http://127.0.0.1:8787',
+          target: `http://127.0.0.1:${apiPort}`,
           changeOrigin: true,
           timeout: 60_000,
           configure: (proxy) => {
             proxy.on('error', (err) => {
-              console.error('[vite proxy] /api -> 127.0.0.1:8787', err.message);
+              console.error(`[vite proxy] /api -> 127.0.0.1:${apiPort}`, err.message);
             });
           },
         },
@@ -112,9 +169,11 @@ export default defineConfig(({mode}) => {
       },
     },
     preview: {
+      port: devPort,
+      strictPort: false,
       proxy: {
         '/api': {
-          target: 'http://127.0.0.1:8787',
+          target: `http://127.0.0.1:${apiPort}`,
           changeOrigin: true,
           timeout: 60_000,
           configure: (proxy) => {

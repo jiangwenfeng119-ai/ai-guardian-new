@@ -59,6 +59,7 @@ function TabLoading({ label }: { label: string }) {
 }
 
 const STORAGE_KEY_CONTROLS = 'ai_guardian_controls_v1';
+const DEEP_EVAL_TASKS_STORAGE_PREFIX = 'ai_guardian_deep_eval_tasks_v1';
 /** 已完成任务卡片：按 findings 统计合规率与各状态数量 */
 function completedTaskFindingStats(findings: Assessment['findings']) {
   let compliant = 0;
@@ -107,8 +108,6 @@ const I18N: Record<LocaleId, Record<string, string>> = {
     emptyNoAssessments: '暂无评估任务，点击上方按钮新建',
     emptyNoMatches: '当前筛选条件下暂无任务',
     deleteTaskTitle: '删除任务',
-    deleteTaskConfirm:
-      '确定删除该评估任务？本任务下的分析结果与本地记录将被移除（浏览器下载的导出文件需自行删除）。',
     labelCompany: '公司',
     labelProject: '项目',
     statComplianceRate: '合规率',
@@ -143,8 +142,6 @@ const I18N: Record<LocaleId, Record<string, string>> = {
     emptyNoAssessments: 'No assessments yet. Use the button above to create one.',
     emptyNoMatches: 'No tasks match the current filters.',
     deleteTaskTitle: 'Delete task',
-    deleteTaskConfirm:
-      'Delete this assessment? Analysis results and server records for this task will be removed (exported files you downloaded stay on disk).',
     labelCompany: 'Company',
     labelProject: 'Project',
     statComplianceRate: 'Compliance',
@@ -166,6 +163,8 @@ type DeepEvalTaskRecord = {
   done: number;
   updatedFindings: number;
   affectedAssessmentIds: string[];
+  affectedCompanyIds?: string[];
+  affectedProjectIds?: string[];
   reportSummary?: string;
   error?: string;
   itemRuns?: Array<{
@@ -205,6 +204,9 @@ export default function App() {
   const [assessmentCompanyFilter, setAssessmentCompanyFilter] = useState('all');
   const [assessmentProjectFilter, setAssessmentProjectFilter] = useState('all');
   const [assessmentCreatorFilter, setAssessmentCreatorFilter] = useState('all');
+  const [dashboardCompanyFilter, setDashboardCompanyFilter] = useState('all');
+  const [dashboardProjectFilter, setDashboardProjectFilter] = useState('all');
+  const [assessmentViewScope, setAssessmentViewScope] = useState<'visible' | 'mine'>('visible');
   const [deepEvaluating, setDeepEvaluating] = useState(false);
   const [deepEvalNotice, setDeepEvalNotice] = useState<string | null>(null);
   const [deepEvalTasks, setDeepEvalTasks] = useState<DeepEvalTaskRecord[]>([]);
@@ -320,6 +322,34 @@ export default function App() {
     };
   }, [user]);
 
+  useEffect(() => {
+    if (!user?.id) return;
+    try {
+      const raw = localStorage.getItem(`${DEEP_EVAL_TASKS_STORAGE_PREFIX}:${user.id}`);
+      if (!raw) {
+        setDeepEvalTasks([]);
+        return;
+      }
+      const parsed = JSON.parse(raw) as DeepEvalTaskRecord[];
+      if (!Array.isArray(parsed)) {
+        setDeepEvalTasks([]);
+        return;
+      }
+      setDeepEvalTasks(parsed);
+    } catch {
+      setDeepEvalTasks([]);
+    }
+  }, [user?.id]);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    try {
+      localStorage.setItem(`${DEEP_EVAL_TASKS_STORAGE_PREFIX}:${user.id}`, JSON.stringify(deepEvalTasks));
+    } catch {
+      // ignore quota errors
+    }
+  }, [user?.id, deepEvalTasks]);
+
   /** 差距分析 / 深度评估使用的模型配置：与 GET /api/settings 返回的 model 同步（服务端优先）。 */
   useEffect(() => {
     if (!user) return;
@@ -328,10 +358,18 @@ export default function App() {
     else clearServerAiModelSnapshot();
   }, [user, settingsForPerm?.model]);
 
+  /** 与 getLocale()/子组件一致：服务端 locale 写入 localStorage 并派发 app-locale-change，避免出现子组件按中文、App 内 tx() 仍按 en-US 的割裂（例如删除确认框语言错误）。 */
   useEffect(() => {
-    const val = settingsForPerm && typeof settingsForPerm.locale === 'string' ? settingsForPerm.locale : 'zh-CN';
-    setLocaleState(val === 'en-US' ? 'en-US' : 'zh-CN');
-  }, [settingsForPerm]);
+    const val =
+      settingsForPerm && typeof settingsForPerm === 'object' && typeof settingsForPerm.locale === 'string'
+        ? settingsForPerm.locale
+        : 'zh-CN';
+    const next: LocaleId = val === 'en-US' ? 'en-US' : 'zh-CN';
+    setLocaleState(next);
+    if (user && getLocale() !== next) {
+      setLocale(next);
+    }
+  }, [settingsForPerm, user]);
 
   useEffect(() => {
     const onLocale = (e: Event) => {
@@ -351,6 +389,7 @@ export default function App() {
     return getRolePermissions(matrix, user.role as Role);
   }, [user, settingsForPerm]);
   const canAssess = !!effectivePermissions?.runAssessments;
+  const canManageUsers = !!effectivePermissions?.manageUsers;
   const canEditStandards = !!effectivePermissions?.editStandards;
   const evalRuntimeConfig = useMemo(() => {
     const m =
@@ -416,14 +455,15 @@ export default function App() {
     const ac = new AbortController();
     let cancelled = false;
     setAssessmentsHydrated(false);
-    fetchAssessments({ signal: ac.signal })
+    fetchAssessments({ signal: ac.signal, scope: assessmentViewScope })
       .then(({ assessments: list }) => {
         if (cancelled) return;
         const normalized = Array.isArray(list)
           ? list.map((a) => ({ ...a, customerName: a.customerName ?? '', projectName: a.projectName ?? '' }))
           : [];
         setAssessments(normalized);
-        lastSavedAssessmentsSig.current = JSON.stringify(normalized);
+        const mineSig = JSON.stringify(normalized.filter((a) => (a.createdBy || '') === (user.username || '')));
+        lastSavedAssessmentsSig.current = mineSig;
         // Only after a successful read do we enable autosave — otherwise a failed fetch + empty state would PUT [] and wipe server data.
         setAssessmentsHydrated(true);
       })
@@ -436,16 +476,21 @@ export default function App() {
       cancelled = true;
       ac.abort();
     };
-  }, [user?.id, canAssess]);
+  }, [user?.id, user?.username, canAssess, assessmentViewScope]);
+
+  const ownAssessments = useMemo(
+    () => assessments.filter((a) => (a.createdBy || '') === (user?.username || '')),
+    [assessments, user?.username]
+  );
 
   useEffect(() => {
     if (!user || !canAssess || !assessmentsHydrated) return;
-    const sig = JSON.stringify(assessments);
+    const sig = JSON.stringify(ownAssessments);
     if (sig === lastSavedAssessmentsSig.current) return;
-    const hasInProgress = assessments.some((a) => a.status === 'In Progress');
+    const hasInProgress = ownAssessments.some((a) => a.status === 'In Progress');
     const persistDelayMs = hasInProgress ? 30 : 250;
     const timer = setTimeout(() => {
-      void putAssessments(assessments)
+      void putAssessments(ownAssessments)
         .then(() => {
           lastSavedAssessmentsSig.current = sig;
         })
@@ -454,7 +499,7 @@ export default function App() {
         });
     }, persistDelayMs);
     return () => clearTimeout(timer);
-  }, [assessments, user, canAssess, assessmentsHydrated]);
+  }, [ownAssessments, user, canAssess, assessmentsHydrated]);
 
   const visibleNav = useMemo(() => {
     if (!effectivePermissions) return ALL_NAV;
@@ -502,9 +547,28 @@ export default function App() {
     setActiveTab('dashboard');
   }, []);
 
+  const deepEvalSourceAssessments = useMemo(
+    () =>
+      assessments.filter((a) => {
+        const companyOk = dashboardCompanyFilter === 'all' || a.companyId === dashboardCompanyFilter;
+        const projectOk = dashboardProjectFilter === 'all' || a.projectId === dashboardProjectFilter;
+        return companyOk && projectOk;
+      }),
+    [assessments, dashboardCompanyFilter, dashboardProjectFilter]
+  );
+
   const runDeepEvaluation = useCallback(async () => {
     if (!canAssess || deepEvaluating) return;
-    const candidates = assessments
+    if (dashboardCompanyFilter === 'all') {
+      setDeepEvalNotice(
+        tx(
+          '请至少选择客户级别筛选（公司）后再启动深度评估。',
+          'Please select at least a customer-level filter (company) before starting deep evaluation.'
+        )
+      );
+      return;
+    }
+    const candidates = deepEvalSourceAssessments
       .filter((a) => a.status === 'Completed' && (a.evidenceText || '').trim())
       .flatMap((a) =>
         a.findings
@@ -541,6 +605,8 @@ export default function App() {
         done: 0,
         updatedFindings: 0,
         affectedAssessmentIds: [],
+        affectedCompanyIds: [],
+        affectedProjectIds: [],
         itemRuns: [],
       },
       ...prev,
@@ -550,6 +616,8 @@ export default function App() {
     let failedCount = 0;
     const updates = new Map<string, Assessment['findings']>();
     const affectedAssessmentIds = new Set<string>();
+    const affectedCompanyIds = new Set<string>();
+    const affectedProjectIds = new Set<string>();
     const itemRuns: DeepEvalTaskRecord['itemRuns'] = [];
     try {
       const BATCH_SIZE = 2;
@@ -611,6 +679,10 @@ export default function App() {
         for (const result of results) {
           done += 1;
           affectedAssessmentIds.add(result.item.assessmentId);
+          const companyId = assessments.find((a) => a.id === result.item.assessmentId)?.companyId;
+          const projectId = assessments.find((a) => a.id === result.item.assessmentId)?.projectId;
+          if (companyId) affectedCompanyIds.add(companyId);
+          if (projectId) affectedProjectIds.add(projectId);
           if (!result.ok) {
             failedCount += 1;
             itemRuns.push({
@@ -664,6 +736,8 @@ export default function App() {
                   done,
                   updatedFindings: updatedCount,
                   affectedAssessmentIds: Array.from(affectedAssessmentIds),
+                  affectedCompanyIds: Array.from(affectedCompanyIds),
+                  affectedProjectIds: Array.from(affectedProjectIds),
                   itemRuns: itemRuns.slice(-300),
                 }
               : t
@@ -693,6 +767,8 @@ export default function App() {
                 updatedFindings: updatedCount,
                 finishedAt: new Date().toISOString(),
                 affectedAssessmentIds: Array.from(affectedAssessmentIds),
+                affectedCompanyIds: Array.from(affectedCompanyIds),
+                affectedProjectIds: Array.from(affectedProjectIds),
                 itemRuns: itemRuns.slice(-300),
                 reportSummary: tx(
                   `本次共处理 ${candidates.length} 条待关注项，成功更新 ${updatedCount} 条，失败 ${failedCount} 条，影响任务 ${affectedAssessmentIds.size} 个。`,
@@ -720,6 +796,8 @@ export default function App() {
                 updatedFindings: done,
                 finishedAt: new Date().toISOString(),
                 affectedAssessmentIds: Array.from(affectedAssessmentIds),
+                affectedCompanyIds: Array.from(affectedCompanyIds),
+                affectedProjectIds: Array.from(affectedProjectIds),
                 error: e instanceof Error ? e.message : String(e),
               }
             : t
@@ -728,7 +806,7 @@ export default function App() {
     } finally {
       setDeepEvaluating(false);
     }
-  }, [assessments, canAssess, controls, deepEvaluating, locale, tx, evalRuntimeConfig]);
+  }, [deepEvalSourceAssessments, canAssess, controls, deepEvaluating, locale, tx, evalRuntimeConfig, dashboardCompanyFilter, assessments]);
 
   const updateFindingAttentionState = useCallback(
     (assessmentId: string, controlId: string, nextState: 'pending' | 'processing' | 'resolved') => {
@@ -784,19 +862,51 @@ export default function App() {
   const visibleCompaniesForFilter = useMemo(
     () =>
       baseInfo.companies.filter(
-        (c) => !user?.visibleCompanyIds || user.visibleCompanyIds.length === 0 || user.visibleCompanyIds.includes(c.id)
+        (c) =>
+          canManageUsers ||
+          !user?.visibleCompanyIds ||
+          user.visibleCompanyIds.length === 0 ||
+          user.visibleCompanyIds.includes(c.id)
       ),
-    [baseInfo.companies, user?.visibleCompanyIds]
+    [baseInfo.companies, user?.visibleCompanyIds, canManageUsers]
   );
   const visibleProjectsForFilter = useMemo(
     () =>
       baseInfo.projects.filter((p) => {
-        const allowedByUser = !user?.visibleProjectIds || user.visibleProjectIds.length === 0 || user.visibleProjectIds.includes(p.id);
+        const allowedByUser =
+          canManageUsers ||
+          !user?.visibleProjectIds ||
+          user.visibleProjectIds.length === 0 ||
+          user.visibleProjectIds.includes(p.id);
         const allowedByCompany = assessmentCompanyFilter === 'all' || p.companyId === assessmentCompanyFilter;
         return allowedByUser && allowedByCompany;
       }),
-    [baseInfo.projects, user?.visibleProjectIds, assessmentCompanyFilter]
+    [baseInfo.projects, user?.visibleProjectIds, assessmentCompanyFilter, canManageUsers]
   );
+  const visibleProjectsForDashboardFilter = useMemo(
+    () =>
+      baseInfo.projects.filter((p) => {
+        const allowedByUser =
+          canManageUsers ||
+          !user?.visibleProjectIds ||
+          user.visibleProjectIds.length === 0 ||
+          user.visibleProjectIds.includes(p.id);
+        const allowedByCompany = dashboardCompanyFilter === 'all' || p.companyId === dashboardCompanyFilter;
+        return allowedByUser && allowedByCompany;
+      }),
+    [baseInfo.projects, user?.visibleProjectIds, dashboardCompanyFilter, canManageUsers]
+  );
+  const dashboardFilteredAssessments = deepEvalSourceAssessments;
+  const dashboardVisibleDeepEvalTasks = useMemo(() => {
+    const visibleCompanyIds = user?.visibleCompanyIds || [];
+    if (visibleCompanyIds.length === 0) return deepEvalTasks;
+    const visibleSet = new Set(visibleCompanyIds);
+    return deepEvalTasks.filter((task) => {
+      const ids = task.affectedCompanyIds || [];
+      if (ids.length === 0) return true;
+      return ids.some((id) => visibleSet.has(id));
+    });
+  }, [deepEvalTasks, user?.visibleCompanyIds]);
   /** 任务 id 列表变化时强制仪表盘重挂，避免图表库缓存导致删除后 UI 仍显示旧聚合 */
   const dashboardDataVersion = useMemo(() => assessments.map((a) => a.id).join('|'), [assessments]);
 
@@ -1102,10 +1212,82 @@ export default function App() {
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -20 }}
               >
+                {canAssess && (
+                  <div className="mb-5 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setAssessmentViewScope('visible')}
+                      className={cn(
+                        'glass-card px-3 py-1.5 text-xs font-black uppercase tracking-widest',
+                        assessmentViewScope === 'visible' ? 'bg-accent text-white border-accent' : 'text-text-main/70'
+                      )}
+                    >
+                      {tx('可见全部内容', 'All visible')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAssessmentViewScope('mine')}
+                      className={cn(
+                        'glass-card px-3 py-1.5 text-xs font-black uppercase tracking-widest',
+                        assessmentViewScope === 'mine' ? 'bg-accent text-white border-accent' : 'text-text-main/70'
+                      )}
+                    >
+                      {tx('我的评估', 'My assessments')}
+                    </button>
+                    <select
+                      className="glass-input px-4 py-2 text-sm font-semibold"
+                      value={dashboardCompanyFilter}
+                      onChange={(e) => {
+                        const next = e.target.value;
+                        setDashboardCompanyFilter(next);
+                        setDashboardProjectFilter('all');
+                      }}
+                    >
+                      <option value="all">{t('filterAllCompanies')}</option>
+                      {visibleCompaniesForFilter.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.name || c.id}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      className="glass-input px-4 py-2 text-sm font-semibold"
+                      value={dashboardProjectFilter}
+                      onChange={(e) => setDashboardProjectFilter(e.target.value)}
+                    >
+                      <option value="all">{t('filterAllProjects')}</option>
+                      {visibleProjectsForDashboardFilter.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name || p.id}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
                 <Dashboard
-                  assessments={assessments}
-                  deepEvalTasks={deepEvalTasks}
+                  assessments={dashboardFilteredAssessments}
+                  deepEvalTasks={dashboardVisibleDeepEvalTasks}
                   customStandardsCatalog={catalogEntriesMerged}
+                  companyNameById={companyNameById}
+                  projectNameById={projectNameById}
+                  requireCompanyFilterForDeepEval
+                  canStartDeepEval={dashboardCompanyFilter !== 'all'}
+                  deepEvalScopeHint={tx(
+                    dashboardCompanyFilter === 'all'
+                      ? '深度评估至少需按客户（公司）筛选后再发起；当前选择为全部公司。'
+                      : `当前范围：${(visibleCompaniesForFilter.find((c) => c.id === dashboardCompanyFilter)?.name || dashboardCompanyFilter)} / ${
+                          dashboardProjectFilter === 'all'
+                            ? tx('全部项目', 'All projects')
+                            : (visibleProjectsForDashboardFilter.find((p) => p.id === dashboardProjectFilter)?.name || dashboardProjectFilter)
+                        }`,
+                    dashboardCompanyFilter === 'all'
+                      ? 'Deep evaluation requires at least a customer-level (company) filter; currently set to all companies.'
+                      : `Current scope: ${(visibleCompaniesForFilter.find((c) => c.id === dashboardCompanyFilter)?.name || dashboardCompanyFilter)} / ${
+                          dashboardProjectFilter === 'all'
+                            ? tx('全部项目', 'All projects')
+                            : (visibleProjectsForDashboardFilter.find((p) => p.id === dashboardProjectFilter)?.name || dashboardProjectFilter)
+                        }`
+                  )}
                   onUpdateAttentionState={updateFindingAttentionState}
                   onSelectAssessment={
                     canAssess
@@ -1153,6 +1335,26 @@ export default function App() {
                   </button>
                 </div>
                 <div className="mb-6 flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setAssessmentViewScope('visible')}
+                    className={cn(
+                      'glass-card px-3 py-1.5 text-xs font-black uppercase tracking-widest',
+                      assessmentViewScope === 'visible' ? 'bg-accent text-white border-accent' : 'text-text-main/70'
+                    )}
+                  >
+                    {tx('可见全部内容', 'All visible')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAssessmentViewScope('mine')}
+                    className={cn(
+                      'glass-card px-3 py-1.5 text-xs font-black uppercase tracking-widest',
+                      assessmentViewScope === 'mine' ? 'bg-accent text-white border-accent' : 'text-text-main/70'
+                    )}
+                  >
+                    {tx('我的评估', 'My assessments')}
+                  </button>
                   <select
                     className="glass-input px-4 py-2 text-sm font-semibold"
                     value={assessmentCompanyFilter}
@@ -1202,26 +1404,28 @@ export default function App() {
                   standards={mergedAppStandards}
                   companies={baseInfo.companies}
                   projects={baseInfo.projects}
-                  visibleCompanyIds={user?.visibleCompanyIds || []}
-                  visibleProjectIds={user?.visibleProjectIds || []}
+                  visibleCompanyIds={canManageUsers ? [] : user?.visibleCompanyIds || []}
+                  visibleProjectIds={canManageUsers ? [] : user?.visibleProjectIds || []}
                   onConfirm={({ standardId, customerName, projectName, companyId, projectId }) => {
                     const std = mergedAppStandards.find((s) => s.id === standardId);
                     const newId = `eval-${Date.now()}`;
                     setAssessments((prev) => [
                       ...prev,
                       (() => {
-                        const sameScope = prev.filter((a) => a.companyId === companyId && a.projectId === projectId);
+                        const sameScope = prev.filter(
+                          (a) => a.standardId === standardId && a.companyId === companyId && a.projectId === projectId
+                        );
                         const maxSeq = sameScope.reduce((acc, a) => {
                           const fromField = Number(a.sequenceNo || 0);
                           const fromName = (() => {
-                            const m = String(a.name || '').match(/(?:^|\s·\s)(\d{2})$/);
+                            const m = String(a.name || '').match(/(?:^|\s·\s)v(\d+)$/i);
                             return m ? Number(m[1]) : 0;
                           })();
                           return Math.max(acc, fromField, fromName);
                         }, 0);
                         const sequenceNo = maxSeq + 1;
                         const seqLabel = String(sequenceNo).padStart(2, '0');
-                        const name = `${buildAssessmentDisplayName(std?.name || standardId, customerName, projectName)} · ${seqLabel}`;
+                        const name = `${buildAssessmentDisplayName(std?.name || standardId, customerName, projectName)} · v${seqLabel}`;
                         return {
                           id: newId,
                           name,
@@ -1271,23 +1475,31 @@ export default function App() {
                           canAssess ? 'cursor-pointer hover:-translate-y-1 active:scale-95' : 'opacity-60 cursor-not-allowed'
                         )}
                       >
-                        {canAssess && (
+                        {canAssess && (item.createdBy || '') === (user?.username || '') && (
                           <button
                             type="button"
                             title={t('deleteTaskTitle')}
                             className="absolute top-4 right-4 z-10 p-2 rounded-lg text-text-main/35 hover:text-danger-main hover:bg-danger-main/10 transition-colors"
                             onClick={(e) => {
                               e.stopPropagation();
-                              if (!window.confirm(t('deleteTaskConfirm'))) {
+                              if (
+                                !window.confirm(
+                                  tx(
+                                    '确定删除该评估任务？该任务的分析结果与服务端记录将被移除（您已下载到本机的导出文件仍会保留在磁盘上）。',
+                                    'Delete this assessment? Analysis results and server records for this task will be removed (exported files you downloaded stay on disk).'
+                                  )
+                                )
+                              ) {
                                 return;
                               }
                               setAssessments((prev) => {
                                 const next = prev.filter((a) => a.id !== item.id);
+                                const ownNext = next.filter((a) => (a.createdBy || '') === (user?.username || ''));
                                 if (assessmentsHydrated && getAuthToken()) {
                                   queueMicrotask(() => {
-                                    void putAssessments(next)
+                                    void putAssessments(ownNext)
                                       .then(() => {
-                                        lastSavedAssessmentsSig.current = JSON.stringify(next);
+                                        lastSavedAssessmentsSig.current = JSON.stringify(ownNext);
                                       })
                                       .catch((err) => {
                                         console.error('Failed to persist assessment delete:', err);
@@ -1325,7 +1537,7 @@ export default function App() {
                         <p className="text-xs font-semibold text-text-main/50 mb-4 uppercase tracking-wider">
                           {standardNameById[item.standardId || ''] || item.standardId}
                         </p>
-                        {canAssess && (
+                        {canAssess && (item.createdBy || '') === (user?.username || '') && (
                           <button
                             type="button"
                             className="mb-4 glass-card px-3 py-2 text-[11px] font-black uppercase tracking-widest hover:bg-white/70"

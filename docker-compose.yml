@@ -15,6 +15,8 @@ services:
       API_PORT: "8787"
       SERVE_DIST: "1"
       DATA_DIR: /app/data
+      # 定时备份 targetDir 若使用 /backups，需挂载卷；也可留空仅用 data/auto-backups
+      BACKUP_ALLOWED_ROOT: ${BACKUP_ALLOWED_ROOT:-/backups}
       # 生产环境请设置强随机密钥
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
       # 容器内访问宿主机 Ollama；Linux 需配合下方 extra_hosts。宿主机 Ollama 需监听 0.0.0.0（见 docker-build.env.example）
@@ -23,3 +25,4 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/app/data
+      - ./backups:/backups

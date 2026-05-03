@@ -19,6 +19,8 @@ interface DashboardProps {
     done: number;
     updatedFindings: number;
     affectedAssessmentIds: string[];
+    affectedCompanyIds?: string[];
+    affectedProjectIds?: string[];
     reportSummary?: string;
     error?: string;
     itemRuns?: Array<{
@@ -40,6 +42,11 @@ interface DashboardProps {
   ) => void;
   onSelectAssessment: (id: string) => void;
   onDeepEvaluate: () => void;
+  companyNameById?: Record<string, string>;
+  projectNameById?: Record<string, string>;
+  canStartDeepEval?: boolean;
+  requireCompanyFilterForDeepEval?: boolean;
+  deepEvalScopeHint?: string;
   deepEvaluating?: boolean;
   deepEvalNotice?: string | null;
   customStandardsCatalog?: StandardCatalogEntry[];
@@ -51,6 +58,11 @@ export default function Dashboard({
   onUpdateAttentionState,
   onSelectAssessment,
   onDeepEvaluate,
+  companyNameById = {},
+  projectNameById = {},
+  canStartDeepEval = true,
+  requireCompanyFilterForDeepEval = false,
+  deepEvalScopeHint = '',
   deepEvaluating = false,
   deepEvalNotice = null,
   customStandardsCatalog = [],
@@ -226,9 +238,21 @@ export default function Dashboard({
             <h3 className="text-3xl font-black mb-4 tracking-tight leading-tight">{tx('优化您的安全合规链路', 'Optimize Your Security Compliance Workflow')}</h3>
             <p className="text-white/80 font-medium text-lg leading-relaxed mb-8">{ctaSummary}</p>
             <div className="flex gap-4">
-              <button onClick={onDeepEvaluate} disabled={deepEvaluating} className="bg-white text-accent px-8 py-3 rounded-xl text-sm font-black disabled:opacity-60">{deepEvaluating ? tx('深度评估中…', 'Deep Evaluation Running...') : tx('启动深度评估', 'Start Deep Evaluation')}</button>
+              <button
+                onClick={onDeepEvaluate}
+                disabled={deepEvaluating || !canStartDeepEval}
+                className="bg-white text-accent px-8 py-3 rounded-xl text-sm font-black disabled:opacity-60"
+              >
+                {deepEvaluating ? tx('深度评估中…', 'Deep Evaluation Running...') : tx('启动深度评估', 'Start Deep Evaluation')}
+              </button>
               <button type="button" onClick={() => setDeepTasksOpen(true)} className="bg-white/10 text-white px-8 py-3 rounded-xl text-sm font-black border border-white/20 disabled:opacity-50" disabled={deepEvalTasks.length === 0}>{tx('查看任务详情', 'View Task Details')}</button>
             </div>
+            {deepEvalScopeHint ? (
+              <p className="mt-3 text-xs font-semibold text-white/85 bg-white/10 border border-white/25 rounded-lg px-3 py-2">
+                {deepEvalScopeHint}
+                {requireCompanyFilterForDeepEval ? ` ${tx('（深度评估至少需客户级筛选）', '(Deep evaluation requires at least customer-level filtering)')}` : ''}
+              </p>
+            ) : null}
             {deepEvalNotice ? <p className="mt-4 text-xs font-semibold text-white/85 bg-white/10 border border-white/25 rounded-lg px-3 py-2">{deepEvalNotice}</p> : null}
           </div>
           <div className="relative w-48 h-48 shrink-0">
@@ -298,6 +322,16 @@ export default function Dashboard({
                       </div>
                       <p className="text-xs text-text-main/60 mt-1">{tx('进度', 'Progress')}: {task.done}/{task.total} · {tx('更新项', 'Updated')}: {task.updatedFindings} · {tx('影响任务', 'Affected Tasks')}: {task.affectedAssessmentIds.length}</p>
                       <p className="text-xs text-text-main/55 mt-1">{tx('开始', 'Started')}: {new Date(task.startedAt).toLocaleString()}{task.finishedAt ? ` · ${tx('完成', 'Finished')}: ${new Date(task.finishedAt).toLocaleString()}` : ''}</p>
+                      <p className="text-xs text-text-main/55 mt-1">
+                        {tx('涉及客户', 'Affected Customers')}: {(task.affectedCompanyIds || []).length > 0
+                          ? (task.affectedCompanyIds || []).map((id) => companyNameById[id] || id).join('，')
+                          : '—'}
+                      </p>
+                      <p className="text-xs text-text-main/55 mt-1">
+                        {tx('涉及项目', 'Affected Projects')}: {(task.affectedProjectIds || []).length > 0
+                          ? (task.affectedProjectIds || []).map((id) => projectNameById[id] || id).join('，')
+                          : '—'}
+                      </p>
                       {task.reportSummary ? <p className="text-xs text-text-main/75 mt-2">{task.reportSummary}</p> : null}
                       {task.error ? <p className="text-xs text-danger-main mt-2">{task.error}</p> : null}
                       {Array.isArray(task.itemRuns) && task.itemRuns.length > 0 ? (

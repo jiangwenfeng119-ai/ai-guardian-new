@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   Brain,
@@ -11,6 +11,8 @@ import {
   Info,
   Loader2,
   Users,
+  HardDriveDownload,
+  FileText,
 } from 'lucide-react';
 import {
   apiHealth,
@@ -19,6 +21,8 @@ import {
   postLegalRegulationsFetch,
   postModelConnectionTest,
   putSettings,
+  downloadBackupZip,
+  importBackupZip,
 } from '../services/settingsApi';
 import UserManagement from './UserManagement';
 import UserActivityDashboard from './UserActivityDashboard';
@@ -120,7 +124,25 @@ const parseFromStorage = <T,>(key: string, fallback: T): T => {
   }
 };
 
-type SettingsTabId = 'baseInfo' | 'users' | 'ai' | 'audit' | 'usageAudit' | 'about';
+type SettingsTabId = 'baseInfo' | 'users' | 'ai' | 'audit' | 'usageAudit' | 'about' | 'backup';
+
+type BackupSettingsForm = {
+  enabled: boolean;
+  intervalHours: number;
+  targetDir: string;
+  maxFiles: number;
+  lastRunAt: string;
+  lastError: string;
+};
+
+const DEFAULT_BACKUP_FORM: BackupSettingsForm = {
+  enabled: false,
+  intervalHours: 24,
+  targetDir: '',
+  maxFiles: 14,
+  lastRunAt: '',
+  lastError: '',
+};
 type BaseInfoModalState =
   | { kind: 'company'; mode: 'add' | 'edit'; id?: string }
   | { kind: 'project'; mode: 'add' | 'edit'; id?: string }
@@ -148,7 +170,7 @@ function mapAuditCategory(action: string): AuditCategoryId {
   if (!action) return 'other';
   if (action.startsWith('model.runtime.')) return 'modelRuntime';
   if (action.startsWith('auth.')) return 'auth';
-  if (action.startsWith('settings.')) return 'settings';
+  if (action.startsWith('settings.') || action.startsWith('backup.')) return 'settings';
   if (action.startsWith('users.')) return 'users';
   if (action.startsWith('legal-regulations.')) return 'legal';
   if (action.startsWith('standards.sync.')) return 'standards';
@@ -217,6 +239,40 @@ function formatAuditTsChina(entry: unknown, locale: 'zh-CN' | 'en-US' = 'zh-CN')
   }
 }
 
+function extractAssessmentPerfSummary(entry: unknown):
+  | {
+      overallAvgDurationPerFindingMs: number | null;
+      avgTaskDurationPerFindingMs: number | null;
+      totalDurationMs: number;
+      totalFindings: number;
+      taskCount: number;
+      validDurationTaskCount: number;
+    }
+  | null {
+  if (!entry || typeof entry !== 'object') return null;
+  const obj = entry as Record<string, unknown>;
+  if (String(obj.action || '') !== 'assessments.save') return null;
+  const detail = obj.detail && typeof obj.detail === 'object' ? (obj.detail as Record<string, unknown>) : null;
+  const perf = detail?.performance && typeof detail.performance === 'object'
+    ? (detail.performance as Record<string, unknown>)
+    : null;
+  if (!perf) return null;
+  const totalDurationMs = Number(perf.totalDurationMs);
+  const totalFindings = Number(perf.totalFindings);
+  const taskCount = Number(perf.taskCount);
+  const validDurationTaskCount = Number(perf.validDurationTaskCount);
+  const overall = Number(perf.overallAvgDurationPerFindingMs);
+  const avgTask = Number(perf.avgTaskDurationPerFindingMs);
+  return {
+    overallAvgDurationPerFindingMs: Number.isFinite(overall) ? overall : null,
+    avgTaskDurationPerFindingMs: Number.isFinite(avgTask) ? avgTask : null,
+    totalDurationMs: Number.isFinite(totalDurationMs) ? totalDurationMs : 0,
+    totalFindings: Number.isFinite(totalFindings) ? totalFindings : 0,
+    taskCount: Number.isFinite(taskCount) ? taskCount : 0,
+    validDurationTaskCount: Number.isFinite(validDurationTaskCount) ? validDurationTaskCount : 0,
+  };
+}
+
 function defaultSettingsTab(p: Record<PermissionKey, boolean>): SettingsTabId {
   if (p.manageUsers) return 'baseInfo';
   if (p.configureAiModel || p.editStandards) return 'ai';
@@ -241,6 +297,7 @@ const SETTINGS_HEADER_TEXT = {
     aiTab: 'AI 大模型配置',
     auditTab: '审计日志',
     aboutTab: '关于',
+    backupTab: '备份与恢复',
   },
   'en-US': {
     title: 'System Core Settings',
@@ -256,6 +313,7 @@ const SETTINGS_HEADER_TEXT = {
     aiTab: 'AI Model Settings',
     auditTab: 'Audit Logs',
     aboutTab: 'About',
+    backupTab: 'Backup & Restore',
   },
 } as const;
 
@@ -299,6 +357,13 @@ export default function SystemSettings({
   const [legalTestResult, setLegalTestResult] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [errorNotice, setErrorNotice] = useState<string | null>(null);
+  const [backupForm, setBackupForm] = useState<BackupSettingsForm>({ ...DEFAULT_BACKUP_FORM });
+  const [backupSaving, setBackupSaving] = useState(false);
+  const [backupExporting, setBackupExporting] = useState(false);
+  const [backupImporting, setBackupImporting] = useState(false);
+  const [importConfirmChecked, setImportConfirmChecked] = useState(false);
+  const [importBackupFile, setImportBackupFile] = useState<File | null>(null);
+  const importBackupInputRef = useRef<HTMLInputElement>(null);
 
   const [backendReady, setBackendReady] = useState(false);
   const [backendLoading, setBackendLoading] = useState(true);
@@ -325,6 +390,12 @@ export default function SystemSettings({
       sync: ApiSyncSettings;
       permissions: PermissionMatrix;
       baseInfo: BaseInfoSettings;
+      backupEditable?: {
+        enabled: boolean;
+        intervalHours: number;
+        targetDir: string;
+        maxFiles: number;
+      };
     }) => {
       const tracked: Record<string, unknown> = {};
       if (effectivePermissions.configureAiModel) tracked.model = payload.model;
@@ -333,9 +404,12 @@ export default function SystemSettings({
         tracked.permissions = payload.permissions;
         tracked.baseInfo = payload.baseInfo;
       }
+      if (role === 'SuperAdmin' && payload.backupEditable) {
+        tracked.backup = payload.backupEditable;
+      }
       return JSON.stringify(tracked);
     },
-    [effectivePermissions]
+    [effectivePermissions, role]
   );
   const currentTrackedSignature = useMemo(
     () =>
@@ -344,8 +418,28 @@ export default function SystemSettings({
         sync: apiSyncSettings,
         permissions: permissionMatrix,
         baseInfo: baseInfoSettings,
+        backupEditable:
+          role === 'SuperAdmin'
+            ? {
+                enabled: backupForm.enabled,
+                intervalHours: backupForm.intervalHours,
+                targetDir: backupForm.targetDir,
+                maxFiles: backupForm.maxFiles,
+              }
+            : undefined,
       }),
-    [buildTrackedSettingsSignature, modelSettings, apiSyncSettings, permissionMatrix, baseInfoSettings]
+    [
+      buildTrackedSettingsSignature,
+      modelSettings,
+      apiSyncSettings,
+      permissionMatrix,
+      baseInfoSettings,
+      role,
+      backupForm.enabled,
+      backupForm.intervalHours,
+      backupForm.targetDir,
+      backupForm.maxFiles,
+    ]
   );
   const [savedTrackedSignature, setSavedTrackedSignature] = useState<string>('');
   const t = (k: keyof (typeof SETTINGS_HEADER_TEXT)['zh-CN']) =>
@@ -431,12 +525,31 @@ export default function SystemSettings({
       setApiSyncSettings(mergedSync);
       setPermissionMatrix(mergedPerm);
       setBaseInfoSettings(mergedBaseInfo);
+      const rawB = s.backup && typeof s.backup === 'object' ? (s.backup as Record<string, unknown>) : {};
+      const loadedBackup: BackupSettingsForm = {
+        enabled: !!rawB.enabled,
+        intervalHours: Math.min(168, Math.max(1, Number(rawB.intervalHours) || 24)),
+        targetDir: String(rawB.targetDir || ''),
+        maxFiles: Math.min(500, Math.max(1, Number(rawB.maxFiles) || 14)),
+        lastRunAt: String(rawB.lastRunAt || ''),
+        lastError: String(rawB.lastError || ''),
+      };
+      setBackupForm(loadedBackup);
       setSavedTrackedSignature(
         buildTrackedSettingsSignature({
           model: mergedModel,
           sync: mergedSync,
           permissions: mergedPerm,
           baseInfo: mergedBaseInfo,
+          backupEditable:
+            role === 'SuperAdmin'
+              ? {
+                  enabled: loadedBackup.enabled,
+                  intervalHours: loadedBackup.intervalHours,
+                  targetDir: loadedBackup.targetDir,
+                  maxFiles: loadedBackup.maxFiles,
+                }
+              : undefined,
         })
       );
       localStorage.setItem(STORAGE_MODEL_KEY, JSON.stringify(mergedModel));
@@ -459,7 +572,7 @@ export default function SystemSettings({
     } finally {
       setBackendLoading(false);
     }
-  }, [onSessionExpired, buildTrackedSettingsSignature, tx]);
+  }, [onSessionExpired, buildTrackedSettingsSignature, tx, role]);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -520,6 +633,14 @@ export default function SystemSettings({
       body.permissions = permissionMatrix;
       body.baseInfo = baseInfoSettings;
     }
+    if (role === 'SuperAdmin') {
+      body.backup = {
+        enabled: backupForm.enabled,
+        intervalHours: backupForm.intervalHours,
+        targetDir: backupForm.targetDir.trim(),
+        maxFiles: backupForm.maxFiles,
+      };
+    }
     if (Object.keys(body).length === 0) {
       setErrorNotice(tx('当前角色没有可保存的配置项', 'Nothing to save for this role'));
       return;
@@ -556,12 +677,34 @@ export default function SystemSettings({
       const nextBaseInfo = s.baseInfo
         ? { ...DEFAULT_BASE_INFO_SETTINGS, ...(s.baseInfo as Partial<BaseInfoSettings>) }
         : baseInfoSettings;
+      let nextBackupForm = backupForm;
+      if (role === 'SuperAdmin' && s.backup && typeof s.backup === 'object') {
+        const b = s.backup as Record<string, unknown>;
+        nextBackupForm = {
+          enabled: !!b.enabled,
+          intervalHours: Math.min(168, Math.max(1, Number(b.intervalHours) || 24)),
+          targetDir: String(b.targetDir || ''),
+          maxFiles: Math.min(500, Math.max(1, Number(b.maxFiles) || 14)),
+          lastRunAt: String(b.lastRunAt || ''),
+          lastError: String(b.lastError || ''),
+        };
+        setBackupForm(nextBackupForm);
+      }
       setSavedTrackedSignature(
         buildTrackedSettingsSignature({
           model: nextModel,
           sync: nextSync,
           permissions: nextPerm,
           baseInfo: nextBaseInfo,
+          backupEditable:
+            role === 'SuperAdmin'
+              ? {
+                  enabled: nextBackupForm.enabled,
+                  intervalHours: nextBackupForm.intervalHours,
+                  targetDir: nextBackupForm.targetDir,
+                  maxFiles: nextBackupForm.maxFiles,
+                }
+              : undefined,
         })
       );
       persistLocal();
@@ -575,6 +718,78 @@ export default function SystemSettings({
         return;
       }
       setErrorNotice(e instanceof Error ? e.message : tx('保存失败', 'Save failed'));
+    }
+  };
+
+  const handleBackupExport = async () => {
+    if (!backendReady) {
+      setErrorNotice(tx('后端未连接，无法导出备份', 'Backend disconnected; cannot export backup'));
+      return;
+    }
+    setBackupExporting(true);
+    setErrorNotice(null);
+    try {
+      const { blob, suggestedFilename } = await downloadBackupZip();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = suggestedFilename;
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setNotice(tx('备份已开始下载', 'Backup download started'));
+      setTimeout(() => setNotice(null), 2500);
+    } catch (e) {
+      if (e instanceof Error && e.message === 'SESSION_EXPIRED') {
+        onSessionExpired();
+        return;
+      }
+      setErrorNotice(e instanceof Error ? e.message : tx('导出备份失败', 'Backup export failed'));
+    } finally {
+      setBackupExporting(false);
+    }
+  };
+
+  const handleBackupImport = async () => {
+    if (!backendReady) {
+      setErrorNotice(tx('后端未连接，无法导入备份', 'Backend disconnected; cannot import backup'));
+      return;
+    }
+    if (!importBackupFile) {
+      setErrorNotice(tx('请选择备份 zip 文件', 'Select a backup .zip file'));
+      return;
+    }
+    if (!importConfirmChecked) {
+      setErrorNotice(
+        tx('请勾选确认：导入将用备份覆盖当前数据（不可撤销）', 'Check the box to confirm import will overwrite current data (irreversible)')
+      );
+      return;
+    }
+    setBackupImporting(true);
+    setErrorNotice(null);
+    try {
+      const r = await importBackupZip(importBackupFile);
+      setImportBackupFile(null);
+      setImportConfirmChecked(false);
+      if (importBackupInputRef.current) importBackupInputRef.current.value = '';
+      setNotice(
+        (r.message || tx('导入完成', 'Import completed')) +
+          (r.snapshotDir ? ` (${tx('快照', 'snapshot')}: ${r.snapshotDir})` : '')
+      );
+      setTimeout(() => setNotice(null), 5000);
+      await loadFromServer();
+      await refreshAudit();
+      onUsersChanged?.();
+    } catch (e) {
+      if (e instanceof Error && e.message === 'SESSION_EXPIRED') {
+        onSessionExpired();
+        return;
+      }
+      setErrorNotice(e instanceof Error ? e.message : tx('导入备份失败', 'Backup import failed'));
+    } finally {
+      setBackupImporting(false);
     }
   };
 
@@ -759,7 +974,7 @@ export default function SystemSettings({
   };
 
   const showSaveAllSettings =
-    can('configureAiModel') || can('editStandards') || can('manageUsers');
+    can('configureAiModel') || can('editStandards') || can('manageUsers') || role === 'SuperAdmin';
   const hasUnsavedChanges = showSaveAllSettings && savedTrackedSignature !== currentTrackedSignature;
 
   const testModelConnection = async (ensureReady = false, target: 'primary' | 'local' | 'cloud' | 'all' = 'primary') => {
@@ -805,8 +1020,15 @@ export default function SystemSettings({
   const showAuditTab = can('viewAuditLog');
   const showUsageAuditTab = can('viewAuditLog');
   const showAboutTab = can('viewAppAbout');
+  const showBackupTab = role === 'SuperAdmin';
   const hasAnySettingsTab =
-    showBaseInfoTab || showUsersTab || showAiTab || showAuditTab || showUsageAuditTab || showAboutTab;
+    showBaseInfoTab ||
+    showUsersTab ||
+    showAiTab ||
+    showAuditTab ||
+    showUsageAuditTab ||
+    showAboutTab ||
+    showBackupTab;
   const filteredCompanies = useMemo(() => {
     const { companies, projects, teams } = baseInfoSettings;
     const projectCountByCompany: Record<string, number> = {};
@@ -864,38 +1086,60 @@ export default function SystemSettings({
       else if (showAuditTab) setActiveTab('audit');
       else if (showUsageAuditTab) setActiveTab('usageAudit');
       else if (showAboutTab) setActiveTab('about');
+      else if (showBackupTab) setActiveTab('backup');
     } else if (activeTab === 'users' && !showUsersTab) {
       if (showBaseInfoTab) setActiveTab('baseInfo');
       else if (showAiTab) setActiveTab('ai');
       else if (showAuditTab) setActiveTab('audit');
       else if (showUsageAuditTab) setActiveTab('usageAudit');
       else if (showAboutTab) setActiveTab('about');
+      else if (showBackupTab) setActiveTab('backup');
     } else if (activeTab === 'ai' && !showAiTab) {
       if (showBaseInfoTab) setActiveTab('baseInfo');
       else if (showUsersTab) setActiveTab('users');
       else if (showAuditTab) setActiveTab('audit');
       else if (showUsageAuditTab) setActiveTab('usageAudit');
       else if (showAboutTab) setActiveTab('about');
+      else if (showBackupTab) setActiveTab('backup');
     } else if (activeTab === 'audit' && !showAuditTab) {
       if (showBaseInfoTab) setActiveTab('baseInfo');
       else if (showUsersTab) setActiveTab('users');
       else if (showAiTab) setActiveTab('ai');
       else if (showUsageAuditTab) setActiveTab('usageAudit');
       else if (showAboutTab) setActiveTab('about');
+      else if (showBackupTab) setActiveTab('backup');
     } else if (activeTab === 'usageAudit' && !showUsageAuditTab) {
       if (showBaseInfoTab) setActiveTab('baseInfo');
       else if (showUsersTab) setActiveTab('users');
       else if (showAiTab) setActiveTab('ai');
       else if (showAuditTab) setActiveTab('audit');
       else if (showAboutTab) setActiveTab('about');
+      else if (showBackupTab) setActiveTab('backup');
     } else if (activeTab === 'about' && !showAboutTab) {
       if (showBaseInfoTab) setActiveTab('baseInfo');
       else if (showUsersTab) setActiveTab('users');
       else if (showAiTab) setActiveTab('ai');
       else if (showAuditTab) setActiveTab('audit');
       else if (showUsageAuditTab) setActiveTab('usageAudit');
+      else if (showBackupTab) setActiveTab('backup');
+    } else if (activeTab === 'backup' && !showBackupTab) {
+      if (showBaseInfoTab) setActiveTab('baseInfo');
+      else if (showUsersTab) setActiveTab('users');
+      else if (showAiTab) setActiveTab('ai');
+      else if (showAuditTab) setActiveTab('audit');
+      else if (showUsageAuditTab) setActiveTab('usageAudit');
+      else if (showAboutTab) setActiveTab('about');
     }
-  }, [activeTab, showBaseInfoTab, showUsersTab, showAiTab, showAuditTab, showUsageAuditTab, showAboutTab]);
+  }, [
+    activeTab,
+    showBaseInfoTab,
+    showUsersTab,
+    showAiTab,
+    showAuditTab,
+    showUsageAuditTab,
+    showAboutTab,
+    showBackupTab,
+  ]);
 
   const toggleAuditCategory = (id: AuditCategoryId) => {
     setSelectedAuditCategories((prev) => {
@@ -1040,6 +1284,21 @@ export default function SystemSettings({
             >
               <Activity size={18} />
               {tx('应用使用程度审计', 'Application Usage Audit')}
+            </button>
+          )}
+          {showBackupTab && (
+            <button
+              type="button"
+              onClick={() => setActiveTab('backup')}
+              className={cn(
+                'flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-black uppercase tracking-widest transition-all',
+                activeTab === 'backup'
+                  ? 'bg-accent text-white shadow-lg shadow-accent/25'
+                  : 'text-text-main/70 hover:bg-white/50'
+              )}
+            >
+              <HardDriveDownload size={18} />
+              {t('backupTab')}
             </button>
           )}
           {showAboutTab && (
@@ -1852,6 +2111,17 @@ export default function SystemSettings({
                       <div className="mb-1 text-[10px] font-semibold text-text-main/55">
                         {tx('中国时区（UTC+8）', 'China timezone (UTC+8)')}: {formatAuditTsChina(entry, uiLocale)}
                       </div>
+                      {extractAssessmentPerfSummary(entry) ? (
+                        <div className="mb-2 rounded-lg border border-accent/25 bg-accent/10 px-2 py-1.5 text-[10px] font-semibold text-text-main/75">
+                          {(() => {
+                            const perf = extractAssessmentPerfSummary(entry)!;
+                            return tx(
+                              `评估性能：总耗时 ${perf.totalDurationMs}ms，评估项 ${perf.totalFindings}，整体均值 ${perf.overallAvgDurationPerFindingMs ?? '—'}ms/项，任务均值 ${perf.avgTaskDurationPerFindingMs ?? '—'}ms/项（任务 ${perf.taskCount}，有效耗时 ${perf.validDurationTaskCount}）`,
+                              `Assessment performance: total ${perf.totalDurationMs}ms, findings ${perf.totalFindings}, overall avg ${perf.overallAvgDurationPerFindingMs ?? '—'}ms/item, task avg ${perf.avgTaskDurationPerFindingMs ?? '—'}ms/item (tasks ${perf.taskCount}, valid duration ${perf.validDurationTaskCount})`
+                            );
+                          })()}
+                        </div>
+                      ) : null}
                       {JSON.stringify(entry)}
                     </li>
                   ))}
@@ -1868,6 +2138,185 @@ export default function SystemSettings({
           companies={baseInfoSettings.companies}
           projects={baseInfoSettings.projects}
         />
+      )}
+
+      {activeTab === 'backup' && showBackupTab && (
+        <section className="glass-card p-8 bg-white/40 space-y-8">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <HardDriveDownload size={20} className="text-accent" />
+              <h3 className="text-xl font-black">{t('backupTab')}</h3>
+            </div>
+            <a
+              href={`${import.meta.env.BASE_URL}docs/BACKUP_OPERATOR.${uiLocale === 'en-US' ? 'en-US' : 'zh-CN'}.md`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 rounded-xl border border-accent/25 bg-accent/10 px-3 py-2 text-xs font-black uppercase tracking-widest text-accent hover:bg-accent/15 transition-colors"
+            >
+              <FileText size={16} />
+              {tx('查看运维文档', 'View operator guide')}
+            </a>
+          </div>
+          <p className="text-xs text-text-main/55 font-medium leading-relaxed">
+            {tx(
+              '「导出」由浏览器下载 zip；路径由系统的「另存为」或下载目录决定。定时备份的「目标目录」是服务器（或容器）内路径，Docker 下请挂载卷到宿主机，否则容器删除后备份丢失。从 Git 重新部署后，在此导入备份即可恢复 data 等价内容。',
+              'Export downloads a zip via the browser; the save location is chosen by the OS. Scheduled backup target path is on the server (or inside the container): mount a volume in Docker or backups are lost when the container is removed. After redeploying from Git, import a backup here to restore the equivalent of data/.'
+            )}
+          </p>
+          <div className="rounded-xl border border-warning-main/30 bg-warning-main/10 p-4 text-sm text-text-main/85 space-y-2">
+            <p className="font-black text-warning-main">{tx('敏感与安全', 'Security')}</p>
+            <ul className="list-disc list-inside space-y-1">
+              <li>
+                {tx(
+                  '备份含用户密码哈希与业务数据，请妥善保管 zip 文件。',
+                  'Backups contain password hashes and business data; protect the zip file.'
+                )}
+              </li>
+              <li>
+                {tx(
+                  'JWT_SECRET 与 .env 中的密钥不在 zip 内。若导入后 JWT_SECRET 与备份时不一致，所有会话将失效，需重新登录。',
+                  'JWT_SECRET and other secrets in .env are not inside the zip. If JWT_SECRET differs after import, all sessions become invalid and users must sign in again.'
+                )}
+              </li>
+            </ul>
+          </div>
+
+          <div className="space-y-4">
+            <h4 className="text-sm font-black uppercase tracking-widest text-text-main/50">
+              {tx('手动导出 / 导入', 'Manual export / import')}
+            </h4>
+            <div className="flex flex-wrap gap-3 items-center">
+              <button
+                type="button"
+                className="glass-button px-4 py-2 text-xs font-black uppercase tracking-widest inline-flex items-center gap-2"
+                disabled={!backendReady || backupExporting}
+                onClick={() => void handleBackupExport()}
+              >
+                {backupExporting ? <Loader2 size={16} className="animate-spin" /> : <HardDriveDownload size={16} />}
+                {tx('生成并下载备份', 'Build & download backup')}
+              </button>
+            </div>
+            <div className="space-y-3 max-w-xl">
+              <input
+                ref={importBackupInputRef}
+                type="file"
+                accept=".zip,application/zip"
+                className="block w-full text-sm text-text-main/80 file:mr-3 file:rounded-lg file:border-0 file:bg-accent/15 file:px-3 file:py-2 file:text-xs file:font-black file:uppercase file:tracking-wider"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  setImportBackupFile(f || null);
+                  setImportConfirmChecked(false);
+                }}
+              />
+              <label className="flex items-start gap-2 text-sm cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="mt-1 rounded border-white/40"
+                  checked={importConfirmChecked}
+                  onChange={(e) => setImportConfirmChecked(e.target.checked)}
+                />
+                <span>
+                  {tx(
+                    '我确认：导入将用所选 zip 覆盖当前 settings、users、assessments、bugs、审计与法规缓存等数据，且不可撤销（导入前服务器已自动快照至 data/.pre-import-*）。',
+                    'I confirm: import will overwrite current settings, users, assessments, bugs, audit trail, legal cache, etc. from the selected zip (irreversible). The server saves a pre-import snapshot under data/.pre-import-* first.'
+                  )}
+                </span>
+              </label>
+              <button
+                type="button"
+                className="glass-button px-4 py-2 text-xs font-black uppercase tracking-widest border border-danger-main/40 text-danger-main hover:bg-danger-main/10 inline-flex items-center gap-2"
+                disabled={!backendReady || backupImporting || !importBackupFile || !importConfirmChecked}
+                onClick={() => void handleBackupImport()}
+              >
+                {backupImporting ? <Loader2 size={16} className="animate-spin" /> : null}
+                {tx('上传并导入备份', 'Upload & import backup')}
+              </button>
+            </div>
+          </div>
+
+          <div className="border-t border-white/50 pt-6 space-y-4">
+            <h4 className="text-sm font-black uppercase tracking-widest text-text-main/50">
+              {tx('定时自动备份（服务器路径）', 'Scheduled backup (server path)')}
+            </h4>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className="flex items-center gap-2 text-sm font-medium cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="rounded border-white/40"
+                  checked={backupForm.enabled}
+                  onChange={(e) => setBackupForm((p) => ({ ...p, enabled: e.target.checked }))}
+                />
+                {tx('启用定时备份', 'Enable scheduled backup')}
+              </label>
+              <div>
+                <label className="block text-xs font-black uppercase tracking-wider text-text-main/45 mb-1">
+                  {tx('间隔（小时）', 'Interval (hours)')}
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={168}
+                  className="w-full rounded-lg border border-white/40 bg-white/50 px-3 py-2 text-sm"
+                  value={backupForm.intervalHours}
+                  onChange={(e) =>
+                    setBackupForm((p) => ({
+                      ...p,
+                      intervalHours: Math.min(168, Math.max(1, Number(e.target.value) || 24)),
+                    }))
+                  }
+                />
+              </div>
+              <div className="sm:col-span-2">
+                <label className="block text-xs font-black uppercase tracking-wider text-text-main/45 mb-1">
+                  {tx('目标目录（留空则使用 data/auto-backups）', 'Target directory (empty = data/auto-backups)')}
+                </label>
+                <input
+                  type="text"
+                  className="w-full rounded-lg border border-white/40 bg-white/50 px-3 py-2 text-sm font-mono"
+                  placeholder="/backups"
+                  value={backupForm.targetDir}
+                  onChange={(e) => setBackupForm((p) => ({ ...p, targetDir: e.target.value }))}
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-black uppercase tracking-wider text-text-main/45 mb-1">
+                  {tx('保留文件数', 'Max files to keep')}
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={500}
+                  className="w-full rounded-lg border border-white/40 bg-white/50 px-3 py-2 text-sm"
+                  value={backupForm.maxFiles}
+                  onChange={(e) =>
+                    setBackupForm((p) => ({
+                      ...p,
+                      maxFiles: Math.min(500, Math.max(1, Number(e.target.value) || 14)),
+                    }))
+                  }
+                />
+              </div>
+            </div>
+            <div className="text-xs text-text-main/60 space-y-1 font-medium">
+              <p>
+                <span className="text-text-main/45">{tx('上次运行', 'Last run')}: </span>
+                {backupForm.lastRunAt || '—'}
+              </p>
+              {backupForm.lastError ? (
+                <p className="text-danger-main">
+                  <span className="text-text-main/45">{tx('上次错误', 'Last error')}: </span>
+                  {backupForm.lastError}
+                </p>
+              ) : null}
+            </div>
+            <p className="text-xs text-text-main/50">
+              {tx(
+                '修改后请点击页面右下角「保存全部配置」以写入服务器。Docker 示例：挂载 ./backups:/backups，目标目录填 /backups，并设置环境变量 BACKUP_ALLOWED_ROOT=/backups（见 docker-compose.yml）。',
+                'After changes, use Save All Settings at the bottom-right. Docker: mount ./backups:/backups, set target to /backups, and BACKUP_ALLOWED_ROOT=/backups (see docker-compose.yml).'
+              )}
+            </p>
+          </div>
+        </section>
       )}
 
       {activeTab === 'about' && showAboutTab && (

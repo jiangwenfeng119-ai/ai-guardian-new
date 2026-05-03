@@ -719,7 +719,7 @@ export default function AssessmentFlow({
   const handleExport = async (format: 'excel' | 'word' | 'pdf') => {
     if (!canViewAssessmentResults) return;
     let summary = '';
-    if (format === 'word') {
+    if (format === 'word' || format === 'pdf') {
       summary =
         reportSummaryStatus === 'ready' && reportSummaryText.trim()
           ? reportSummaryText
@@ -732,7 +732,7 @@ export default function AssessmentFlow({
 
     if (format === 'excel') EXPORT_SERVICE.exportToExcel(assessment.findings, currentControls, currentStandard?.name || "");
     if (format === 'word') EXPORT_SERVICE.exportToWord(assessment.findings, currentControls, currentStandard?.name || "", summary);
-    if (format === 'pdf') EXPORT_SERVICE.exportToPDF(assessment.findings, currentControls, currentStandard?.name || "");
+    if (format === 'pdf') EXPORT_SERVICE.exportToPDF(assessment.findings, currentControls, currentStandard?.name || "", summary);
     void postReportDownloadEvent({
       format,
       assessmentId: assessment.id,
